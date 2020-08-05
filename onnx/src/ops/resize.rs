@@ -3,6 +3,8 @@ use crate::pb::*;
 use std::hash::Hash;
 use tract_hir::internal::*;
 
+use tract_ndarray::*;
+
 pub fn resize(
     _ctx: &ParsingContext,
     node: &NodeProto,
@@ -116,6 +118,38 @@ impl Resize {
         }
         bail!("Neither shape not scale makes sense: input_shape: {:?}, scale: {:?}, sizes: {:?}")
     }
+
+    fn resize_one_axis(
+        &self,
+        input: &ArrayViewD<f32>,
+        axis: usize,
+        output_dim: usize,
+    ) -> TractResult<ArrayD<f32>> {
+        let scale = output_dim as f32 / input.shape()[axis] as f32;
+        let mut new_shape: TVec<usize> = input.shape().into();
+        new_shape[axis] = output_dim;
+        let input_dim = input.shape()[axis];
+        struct Transformed {
+            left: usize,
+            frac: f32,
+        };
+        let transformed = (0..output_dim).map(|xo| {
+            let xi = self.coord_transformer.transform(xo, scale, input_dim, output_dim);
+            let left = (xi as usize).min(input_dim - 1).max(0);
+            let frac = xi - left as f32;
+            Transformed { left, frac }
+        }).collect::<Vec<_>>();
+        let output = tract_ndarray::ArrayD::from_shape_fn(&*new_shape, |mut co| -> f32 {
+            let Transformed { left, frac } = transformed[co[axis]];
+            co[axis] = left;
+            let y_left = input[&co];
+            let x_right = (left + 1).min(input_dim - 1);
+            co[axis] = x_right;
+            let y_right = input[&co];
+            self.interpolator.interpolate(y_left, y_right, frac)
+        });
+        Ok(output)
+    }
 }
 
 impl StatelessOp for Resize {
@@ -132,27 +166,7 @@ impl StatelessOp for Resize {
             if output_shape[axis] == data.shape()[axis] {
                 continue;
             } else if output_shape[axis] > data.shape()[axis] {
-                let scale = output_shape[axis] as f32 / data.shape()[axis] as f32;
-                let mut new_shape: TVec<usize> = data.shape().into();
-                new_shape[axis] = output_shape[axis];
-                data = tract_ndarray::ArrayD::from_shape_fn(&*new_shape, |co_o| -> f32 {
-                    let x_out = co_o[axis];
-                    let x_in = self.coord_transformer.transform(
-                        x_out,
-                        scale,
-                        data.shape()[axis],
-                        new_shape[axis],
-                    );
-                    let mut co_i = co_o.clone();
-                    let x_left = (x_in as usize).min(data.shape()[axis] - 1).max(0);
-                    co_i[axis] = x_left;
-                    let y_left = data[&co_i];
-                    let x_right = (x_left + 1).min(data.shape()[axis] - 1);
-                    co_i[axis] = x_right;
-                    let y_right = data[&co_i];
-                    let x_frac = x_in - x_left as f32;
-                    self.interpolator.interpolate(y_left, y_right, x_frac)
-                })
+                data = self.resize_one_axis(&data.view(), axis, output_shape[axis])?
             }
         }
         Ok(tvec!(data.into_arc_tensor()))
