@@ -23,10 +23,15 @@ pub fn parse_spec(size: &str) -> CliResult<InferenceFact> {
         let datum_type = match splits.last().unwrap().to_lowercase().as_str() {
             "f64" => DatumType::F64,
             "f32" => DatumType::F32,
-            "i32" => DatumType::I32,
             "i8" => DatumType::I8,
+            "i16" => DatumType::I16,
+            "i32" => DatumType::I32,
+            "i64" => DatumType::I64,
             "u8" => DatumType::U8,
-            _ => bail!("Type of the input should be f64, f32, i32, i8 or u8."),
+            "u16" => DatumType::U16,
+            "u32" => DatumType::U32,
+            "u64" => DatumType::U64,
+            it => bail!("Unsupported input type: {}", it)
         };
         (Some(datum_type), &splits[0..splits.len() - 1])
     };
@@ -52,6 +57,9 @@ fn parse_values<'a, T: Datum + FromStr>(shape: &[usize], it: Vec<&'a str>) -> Cl
         .into_iter()
         .map(|v| Ok(v.parse::<T>().map_err(|_| format!("Failed to parse {}", v))?))
         .collect::<CliResult<Vec<T>>>()?;
+    if values.len() != shape.iter().product::<usize>() {
+        bail!("Mismatched shape and data: shape is {:?}, but data length is {}.", shape, values.len());
+    }
     Ok(tract_ndarray::Array::from_shape_vec(shape, values)?.into())
 }
 
