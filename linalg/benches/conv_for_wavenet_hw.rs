@@ -6,18 +6,22 @@ use criterion::Criterion;
 fn conv(c: &mut Criterion, dilation: usize, pulse: usize, ci: usize, co: usize) {
     c.bench_function(&format!("conv_d{}p{}ci{}co{}", dilation, pulse, ci, co), move |be| {
         let t = pulse + 2 * dilation;
-        let n = pulse;
-        let data_offsets = (0..pulse).map(|x| x as isize).collect();
-        let kernel_offsets =
+        let data_offsets: Vec<_> = (0..pulse).map(|x| x as isize).collect();
+        let kernel_offsets: Vec<_> =
             (0..ci).flat_map(|ici| (0..3).map(move |x| (ici * t * 3 + x * t) as isize)).collect();
-        let conv = (tract_linalg::ops().sconv)(co, kernel_offsets, data_offsets);
-        let a = tract_linalg::align::realign_vec(
-            vec![0.0; conv.packed_a_len()],
-            conv.packed_a_alignment(),
+        let mut conv = (tract_linalg::ops().mmm_f32)(co, kernel_offsets.len(), data_offsets.len());
+        unsafe {
+            conv.c_from_data_and_strides(t as _, 1);
+        }
+        let a = tract_linalg::align::Buffer::realign_data(
+            &vec![0.0; conv.a_pack().len()],
+            conv.a_pack().alignment(),
         );
         let input = vec![0.0; ci * t];
         let mut output = vec![0.0; co * t];
-        be.iter(move || conv.conv(a.as_ptr(), input.as_ptr(), output.as_mut_ptr(), n as _, 1))
+        be.iter(move || unsafe {
+            conv.run(a.as_ptr(), input.as_ptr(), output.as_mut_ptr(), &[]);
+        });
     });
 }
 

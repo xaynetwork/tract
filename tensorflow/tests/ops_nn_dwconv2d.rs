@@ -3,23 +3,19 @@
 extern crate env_logger;
 #[macro_use]
 extern crate log;
-extern crate ndarray;
 #[macro_use]
 extern crate proptest;
-extern crate protobuf;
-extern crate tract_core;
 extern crate tract_tensorflow;
 
 mod utils;
 
 use crate::utils::*;
-use ndarray::prelude::*;
 use proptest::prelude::*;
-use protobuf::Message;
-use tract_core::prelude::*;
+use tract_ndarray::prelude::*;
 use tract_tensorflow::conform::*;
+use tract_tensorflow::prelude::*;
 use tract_tensorflow::tfpb;
-use tract_tensorflow::tfpb::types::DataType::DT_FLOAT;
+use tract_tensorflow::tfpb::tensorflow::DataType::DtFloat;
 
 fn convolution_pb(stride: usize, valid: bool, k: &Tensor) -> Result<Vec<u8>> {
     let conv = tfpb::node()
@@ -30,7 +26,7 @@ fn convolution_pb(stride: usize, valid: bool, k: &Tensor) -> Result<Vec<u8>> {
         .attr("strides", vec![1, stride as i64, stride as i64, 1])
         .attr("dilations", vec![1, 1, 1, 1])
         .attr("padding", if valid { "VALID" } else { "SAME" })
-        .attr("T", DT_FLOAT);
+        .attr("T", DtFloat);
 
     let graph = tfpb::graph().node(placeholder_f32("data")).node(const_f32("kernel", k)).node(conv);
 
@@ -60,10 +56,10 @@ fn img_and_ker() -> BoxedStrategy<(Array4<f32>, Array4<f32>, usize)> {
         })
         .prop_map(|(img_shape, ker_shape, img, ker, stride)| {
             (
-                Array::from_vec(img.into_iter().map(|i| i as f32).collect())
+                Array::from(img.into_iter().map(|i| i as f32).collect::<Vec<_>>())
                     .into_shape(img_shape)
                     .unwrap(),
-                Array::from_vec(ker.into_iter().map(|i| i as f32).collect())
+                Array::from(ker.into_iter().map(|i| i as f32).collect::<Vec<_>>())
                     .into_shape(ker_shape)
                     .unwrap(),
                 stride,
@@ -118,11 +114,9 @@ fn conv_eval_2() {
 
 #[test]
 fn conv_eval_3() {
-    use ndarray_rand::RandomExt;
-    use rand::distributions::Uniform;
-
-    let i: Tensor = Tensor::from(Array::random((1, 112, 112, 48), Uniform::new(0.0f32, 1.0)));
-    let k: Tensor = Tensor::from(Array::random((3, 3, 48, 1), Uniform::new(0.0f32, 1.0)));
+    let i: Tensor =
+        Tensor::from(Array::from_shape_fn((1, 112, 112, 48), |_| rand::random::<f32>()));
+    let k: Tensor = Tensor::from(Array::from_shape_fn((3, 3, 48, 1), |_| rand::random::<f32>()));
     let conv = tfpb::node()
         .name("conv")
         .op("DepthwiseConv2dNative")
@@ -131,7 +125,7 @@ fn conv_eval_3() {
         .attr("strides", vec![1, 1, 1, 1])
         .attr("dilations", vec![1, 1, 1, 1])
         .attr("padding", "SAME")
-        .attr("T", DT_FLOAT);
+        .attr("T", DtFloat);
 
     let graph =
         tfpb::graph().node(placeholder_f32("data")).node(const_f32("kernel", &k)).node(conv);
@@ -169,5 +163,14 @@ fn conv_eval_7() {
     let i: Tensor = tensor4(&[[[[1.0f32, 2.0]]]]);
     let k: Tensor = tensor4(&[[[[3.0f32, 5.0], [7.0, 11.0]]]]);
     let model = convolution_pb(1, false, &k).unwrap();
+    compare(&model, vec![("data", i.into())], "conv").unwrap();
+}
+
+#[test]
+fn conv_eval_8() {
+    let i: Tensor =
+        tensor4(&[[[[0.0f32], [0.0]], [[0.0], [0.0]]], [[[0.0], [0.0]], [[0.0], [0.0]]]]);
+    let k: Tensor = tensor4(&[[[[0.0f32, 0.0]]]]);
+    let model = convolution_pb(1, true, &k).unwrap();
     compare(&model, vec![("data", i.into())], "conv").unwrap();
 }

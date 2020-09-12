@@ -1,55 +1,40 @@
-use tract_core::internal::*;
-use tract_core::ops::cnn::*;
+use tract_hir::internal::*;
+use tract_hir::ops::cnn;
+use tract_hir::ops::nn::DataFormat;
 
-use crate::tfpb::node_def::NodeDef;
 use crate::model::ParsingContext;
+use crate::tfpb::tensorflow::NodeDef;
 
-pub fn conv2d(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<InferenceOp>> {
-    let data_format = super::data_format(pb)?;
-    let padding = super::padding(pb)?;
+pub fn conv2d(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let strides = super::strides(pb)?;
-    Ok(Box::new(Conv::new(
-        data_format,
-        KernelFormat::HWIO,
-        None,
-        None,
-        padding,
-        Some(strides[1..3].into()),
-        1,
-    )))
+    let mut op =
+        cnn::Conv::default().hwio().padding(super::padding(pb)?).strides(strides[1..3].into());
+    if super::data_format(pb)? == DataFormat::NHWC {
+        op = op.nhwc()
+    }
+    Ok(expand(op))
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(non_snake_case)]
     use super::*;
-    use ndarray::*;
-    use tract_core::ops::cnn::{Conv, KernelFormat, PaddingSpec};
-    use tract_core::ops::nn::DataFormat;
+    use tract_hir::ops::cnn::{Conv, PaddingSpec};
+    use tract_ndarray::*;
 
     fn mk(sizes: &[usize]) -> Tensor {
-        ::ndarray::Array::range(1f32, sizes.iter().product::<usize>() as f32 + 1.0, 1.0)
+        Array::range(1f32, sizes.iter().product::<usize>() as f32 + 1.0, 1.0)
             .into_shape(sizes)
             .unwrap()
             .into()
     }
 
-    fn make_conv(h_stride: usize, v_stride: usize, padding: PaddingSpec) -> Box<InferenceOp> {
-        Box::new(Conv::new(
-            DataFormat::NHWC,
-            KernelFormat::HWIO,
-            None,
-            None,
-            padding,
-            Some(tvec![v_stride, h_stride]),
-            1,
-        ))
+    fn make_conv(h_stride: usize, v_stride: usize, padding: PaddingSpec) -> Box<dyn InferenceOp> {
+        expand(Conv::default().nhwc().hwio().padding(padding).strides(tvec![v_stride, h_stride]))
     }
 
     fn verify(input: Tensor, filter: Tensor, stride: usize, padding: PaddingSpec, expect: &[f32]) {
         let result = make_conv(stride, stride, padding)
-            .as_stateless()
-            .unwrap()
             .eval(tvec![input.into(), filter.into()])
             .unwrap()
             .remove(0);
@@ -89,7 +74,6 @@ mod tests {
 
     #[test]
     fn testConv2D1x2Filter() {
-        // tract_core::setup_test_logger();
         verify(
             mk(&[1, 2, 3, 3]),
             mk(&[1, 2, 3, 3]),
@@ -152,7 +136,7 @@ mod tests {
         let filter = rctensor4(&[[[[0.0f32]]], [[[1.0]]], [[[0.0]]]]);
         let exp = rctensor4(&[[[[1f32]]]]);
 
-        let result = conv.as_stateless().unwrap().eval(tvec![data, filter]).unwrap().remove(0);
+        let result = conv.eval(tvec![data, filter]).unwrap().remove(0);
         assert_eq!(exp, result);
     }
 
@@ -163,39 +147,39 @@ mod tests {
         let filter =
             rctensor4(&[[[[160.72833f32]], [[107.84076]]], [[[247.50552]], [[-38.738464]]]]);
         let exp = rctensor4(&[[[[80142.31f32], [5067.5586]], [[32266.81], [-1812.2109]]]]);
-        let got = &conv.as_stateless().unwrap().eval(tvec![data, filter]).unwrap()[0];
+        let got = &conv.eval(tvec![data, filter]).unwrap()[0];
         //println!("{:?}", got);
         //println!("{:?}", exp);
-        assert!(exp.close_enough(&got, true));
+        exp.close_enough(&got, true).unwrap()
     }
 
     #[test]
     fn inference_1() {
-        let op = make_conv(1, 3, PaddingSpec::Valid);
-        let img = TensorFact::from(ArrayD::<f32>::zeros(vec![1, 1, 7, 1]).into_tensor());
-        let ker = TensorFact::from(ArrayD::<f32>::zeros(vec![1, 3, 1, 1]).into_tensor());
-        let any = TensorFact::default();
+        let mut op = make_conv(1, 3, PaddingSpec::Valid);
+        let img = InferenceFact::from(ArrayD::<f32>::zeros(vec![1, 1, 7, 1]).into_tensor());
+        let ker = InferenceFact::from(ArrayD::<f32>::zeros(vec![1, 3, 1, 1]).into_tensor());
+        let any = InferenceFact::default();
 
-        let (_, output_facts) = op.infer_facts(tvec![&img, &ker], tvec![&any]).unwrap();
+        let (_, output_facts, _) = op.infer_facts(tvec![&img, &ker], tvec![&any], tvec!()).unwrap();
 
         assert_eq!(
             output_facts,
-            tvec![TensorFact::dt_shape(DatumType::F32, shapefact!(1, 1, (7 - 3 + 1), 1))]
+            tvec![InferenceFact::dt_shape(DatumType::F32, shapefactoid!(1, 1, (7 - 3 + 1), 1))]
         );
     }
 
     #[test]
     fn inference_2() {
-        let op = make_conv(1, 1, PaddingSpec::SameUpper);
-        let img = TensorFact::from(ArrayD::<f32>::zeros(vec![1, 1, 1, 1]).into_tensor());
-        let ker = TensorFact::from(ArrayD::<f32>::zeros(vec![1, 1, 1, 1]).into_tensor());
-        let any = TensorFact::default();
+        let mut op = make_conv(1, 1, PaddingSpec::SameUpper);
+        let img = InferenceFact::from(ArrayD::<f32>::zeros(vec![1, 1, 1, 1]).into_tensor());
+        let ker = InferenceFact::from(ArrayD::<f32>::zeros(vec![1, 1, 1, 1]).into_tensor());
+        let any = InferenceFact::default();
 
-        let (_, output_facts) = op.infer_facts(tvec![&img, &ker], tvec![&any]).unwrap();
+        let (_, output_facts, _) = op.infer_facts(tvec![&img, &ker], tvec![&any], tvec!()).unwrap();
 
         assert_eq!(
             output_facts,
-            tvec![TensorFact::dt_shape(DatumType::F32, shapefact!(1, 1, 1, 1))]
+            tvec![InferenceFact::dt_shape(DatumType::F32, shapefactoid!(1, 1, 1, 1))]
         );
     }
 }

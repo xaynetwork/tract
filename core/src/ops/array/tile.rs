@@ -1,23 +1,31 @@
 use crate::internal::*;
 use ndarray::*;
 
-#[derive(Debug, Clone, new, Default)]
-pub struct Tile;
+#[derive(Debug, Clone, new, Default, Hash)]
+pub struct Tile {
+    pub multipliers: TVec<usize>,
+}
+
+tract_linalg::impl_dyn_hash!(Tile);
 
 impl Tile {
-    fn eval_t<T: Datum + Copy>(
-        &self,
-        data: &Arc<Tensor>,
-        indices: &[usize],
-    ) -> TractResult<Arc<Tensor>> {
-        let data = data.to_array_view::<T>()?;
-        let output_shape: TVec<usize> =
-            data.shape().iter().zip(indices.iter()).map(|(&d, &m)| d * m as usize).collect();
+    fn eval_t<T: Datum>(&self, data: &Arc<Tensor>) -> TractResult<Arc<Tensor>> {
+        let view = unsafe { data.to_array_view_unchecked::<T>() };
+        let output_shape: TVec<usize> = view
+            .shape()
+            .iter()
+            .zip(self.multipliers.iter())
+            .map(|(&d, &m)| d * m as usize)
+            .collect();
         let output = ndarray::ArrayD::from_shape_fn(&*output_shape, |coords| {
-            let coords: Vec<usize> =
+            let coords: TVec<usize> =
                 coords.slice().iter().zip(data.shape().iter()).map(|(&x, &d)| x % d).collect();
-            data[&*coords]
+            view[&*coords].clone()
         });
+        let mut output = output.into_tensor();
+        unsafe {
+            output.set_datum_type(data.datum_type());
+        }
 
         Ok(output.into_arc_tensor())
     }
@@ -27,52 +35,33 @@ impl Op for Tile {
     fn name(&self) -> Cow<str> {
         "Tile".into()
     }
+
+    op_core_mir!();
+    op_as_typed_op!();
 }
 
-impl StatelessOp for Tile {
-    fn eval(&self, mut inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
-        let (data, multipliers) = args_2!(inputs);
-        let multipliers: TVec<usize> = multipliers
-            .cast_to::<i32>()?
-            .to_array_view::<i32>()?
+impl EvalOp for Tile {
+    fn is_stateless(&self) -> bool {
+        true
+    }
+
+    fn eval(&self, inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
+        let result =
+            dispatch_datum_by_size!(Self::eval_t(inputs[0].datum_type())(self, &inputs[0]))?;
+        Ok(tvec!(result))
+    }
+}
+
+impl TypedOp for Tile {
+    as_op!();
+
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        let shape = inputs[0]
+            .shape
             .iter()
-            .map(|&x| x as usize)
-            .collect();
-        Ok(tvec!(dispatch_numbers!(Self::eval_t(data.datum_type())(&self, &data, &*multipliers))?))
+            .zip(self.multipliers.iter())
+            .map(|(a, &b)| a.clone() * b)
+            .collect::<TVec<_>>();
+        Ok(tvec!(TypedFact::dt_shape(inputs[0].datum_type, &*shape)?))
     }
-}
-
-impl InferenceRulesOp for Tile {
-    fn rules<'r, 'p: 'r, 's: 'r>(
-        &'s self,
-        s: &mut Solver<'r>,
-        inputs: &'p [TensorProxy],
-        outputs: &'p [TensorProxy],
-    ) -> InferenceResult {
-        check_input_arity(&inputs, 2)?;
-        check_output_arity(&outputs, 1)?;
-        s.equals(&inputs[0].datum_type, &outputs[0].datum_type)?;
-        s.equals(&inputs[0].rank, &outputs[0].rank)?;
-        s.equals(&inputs[1].rank, 1)?;
-        s.equals(&inputs[1].shape[0], inputs[0].rank.bex().to_dim())?;
-        s.given(&inputs[1].value, move |s, mult| {
-            for (ix, &m) in mult.cast_to::<i32>()?.as_slice::<i32>()?.iter().enumerate() {
-                s.equals(m * inputs[0].shape[ix].bex(), &outputs[0].shape[ix])?;
-            }
-            Ok(())
-        })?;
-        // TODO i32 and dim
-        /*
-        s.given(&inputs[0].rank, |s, rank| {
-            for d in 0..(rank as usize) {
-                s.equals(inputs[1].value[d].bex() * &inputs[0].shape[d], &outputs[0].shape[d])?;
-            }
-            Ok(())
-        })?;
-        */
-        Ok(())
-    }
-
-
-    inference_op_as_op!();
 }

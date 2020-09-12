@@ -5,9 +5,15 @@ authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
 edition = "2018"
 
 [dependencies]
+bytes = "0.5"
 fs2 = "0.4"
-tract-core = { path = "../../core" }
-tract-onnx = { path = "../../onnx" }
-env_logger = "0.6.1"
 log = "0.4.6"
-protobuf = "2.4.2"
+prost = "0.6"
+tract-nnef = { path = "../../nnef" }
+tract-onnx = { path = "../../onnx" }
+
+[dev-dependencies]
+env_logger = "0.7"
+
+[build-dependencies]
+fs2 = "0.4"

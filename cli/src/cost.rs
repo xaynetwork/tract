@@ -1,41 +1,19 @@
-use crate::display_graph::*;
-use crate::errors::*;
-use crate::{Parameters, SomeModel};
-use tract_core::internal::*;
+use tract_hir::internal::*;
 
-pub fn handle(params: Parameters, options: DisplayOptions) -> CliResult<()> {
-    let tract = &params.tract_model;
-    match tract {
-        SomeModel::Inference(_) => panic!("Cost can only be performed on typed nets"),
-        SomeModel::Typed(m) => handle_t(m, &params, options),
-        SomeModel::Normalized(m) => handle_t(&m.clone().into_typed()?, &params, options),
-        SomeModel::Pulsed(_, m) => handle_t(&m.clone().into_typed()?, &params, options),
-    }
-}
-
-fn handle_t(
-    model: &TypedModel,
-    params: &Parameters,
-    options: DisplayOptions,
-) -> CliResult<()> {
-    let mut total: HashMap<Cost, TDim> = HashMap::default();
-    let mut display_graph =
-        DisplayGraph::from_model_and_options(model, options)?.with_graph_def(&params.graph)?;
-    for i in ::tract_core::model::eval_order(&model)? {
-        let inputs = model.node_input_facts(i)?;
-        let cost = model.nodes()[i].op().cost(&*inputs)?;
-        if !cost.is_empty() {
-            let rows = cost
-                .iter()
-                .inspect(|(c, i)| *total.entry(*c).or_insert(0.to_dim()) += i)
-                .map(|(c, i)| format!("{:?} {:?}", c, i))
-                .collect();
-            display_graph.add_node_section(i, rows)?;
-        }
-    }
-    display_graph.render()?;
-    for (c, i) in total {
-        println!("{:?}: {:?}", c, i);
-    }
-    Ok(())
+pub fn parse_costs(spec: &str) -> TractResult<Vec<(Cost, usize)>> {
+    spec.split(",")
+        .map(|spec| {
+            let mut toks = spec.split("=");
+            let name = toks.next().unwrap();
+            let n = toks.next().unwrap().parse::<usize>().unwrap();
+            let c = match name {
+                "FMA(F32)" => Cost::FMA(f32::datum_type()),
+                "Div(F32)" => Cost::Div(f32::datum_type()),
+                "Buffer(F32)" => Cost::Buffer(f32::datum_type()),
+                "Params(F32)" => Cost::Params(f32::datum_type()),
+                _ => bail!("Unknown cost specifier {}", name),
+            };
+            Ok((c, n))
+        })
+        .collect()
 }

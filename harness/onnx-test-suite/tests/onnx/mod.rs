@@ -1,12 +1,14 @@
+use std::convert::TryInto;
+use std::hash::Hash;
 use std::{fs, path};
 
 use log::*;
 
-use tract_core::internal::*;
-use tract_onnx::pb::TensorProto;
-use tract_onnx::*;
+use prost::Message;
 
-use std::convert::TryInto;
+use tract_onnx::pb::TensorProto;
+use tract_onnx::prelude::*;
+use tract_onnx::tract_hir;
 
 #[allow(dead_code)]
 fn setup_test_logger() {
@@ -22,20 +24,28 @@ pub fn load_half_dataset(prefix: &str, path: &path::Path) -> TVec<Tensor> {
         .count();
     for i in 0..len {
         let filename = path.join(format!("{}_{}.pb", prefix, i));
-        let mut file =
-            fs::File::open(filename).map_err(|e| format!("accessing {:?}, {:?}", path, e)).unwrap();
-        let tensor: TensorProto = ::protobuf::parse_from_reader(&mut file).unwrap();
+        let bytes = bytes::Bytes::from(std::fs::read(filename).unwrap());
+        let tensor = TensorProto::decode(bytes).unwrap();
         vec.push(tensor.try_into().unwrap())
     }
     debug!("{:?}: {:?}", path, vec);
     vec
 }
 
-pub fn load_dataset(path: &path::Path) -> (TVec<Tensor>, TVec<Tensor>) {
-    (load_half_dataset("input", path), load_half_dataset("output", path))
+#[derive(PartialEq, Copy, Clone, Debug)]
+pub enum Mode {
+    Plain,
+    Optim,
+    NNEF,
 }
 
-pub fn run_one<P: AsRef<path::Path>>(root: P, test: &str, optim: bool) {
+pub fn run_one<P: AsRef<path::Path>>(
+    root: P,
+    test: &str,
+    mode: Mode,
+    more: &'static [&'static str],
+) {
+    use Mode::*;
     setup_test_logger();
     let test_path = root.as_ref().join(test);
     let path = if test_path.join("data.json").exists() {
@@ -52,14 +62,15 @@ pub fn run_one<P: AsRef<path::Path>>(root: P, test: &str, optim: bool) {
             test_path.file_name().unwrap().to_str().unwrap().chars().skip(5).collect();
         info!("Locked {:?}", f);
         if !test_path.join(&name).exists() {
-            let tgz_name = format!("{}.tgz", name);
+            let tgz_name = test_path.join(format!("{}.tgz", name));
+            info!("Downloading {:?}", tgz_name);
             let wget = std::process::Command::new("wget")
                 .arg("-q")
                 .arg(&url)
                 .arg("-O")
                 .arg(&tgz_name)
                 .status()
-                .unwrap();
+                .expect("Failed to run wget");
             if !wget.success() {
                 panic!("wget: {:?}", wget);
             }
@@ -76,90 +87,118 @@ pub fn run_one<P: AsRef<path::Path>>(root: P, test: &str, optim: bool) {
         test_path
     };
     let model_file = path.join("model.onnx");
-    debug!("Loading {:?}", model_file);
+    info!("Loading {:?}", model_file);
     let onnx = onnx();
+    let nnef = tract_nnef::nnef().with_onnx();
     trace!("Proto Model:\n{:#?}", onnx.proto_model_for_path(&model_file));
-    let mut model = onnx.model_for_path(&model_file).unwrap();
-    trace!("Model:\n{:#?}", model);
-    model.analyse(false).unwrap();
-    if model.missing_type_shape().unwrap().len() != 0 {
-        panic!("Incomplete inference {:?}", model.missing_type_shape());
-    }
-    let model = model.into_typed().unwrap();
-    info!("Test model (optim: {:?}) {:#?}", optim, path);
-    if optim {
-        let optimized = model.into_optimized().unwrap();
-        trace!("Run optimized model:\n{:#?}", optimized);
-        run_model(optimized, &path)
-    } else {
-        trace!("Run analysed model:\n{:#?}", model);
-        run_model(model, &path)
-    };
-}
-
-fn run_model(model: TypedModel, path: &path::Path) {
-    let plan = SimplePlan::new(&model).unwrap();
-    for d in fs::read_dir(path).unwrap() {
+    for d in fs::read_dir(&path).unwrap() {
+        let mut model = onnx.model_for_path(&model_file).unwrap();
         let d = d.unwrap();
         if d.metadata().unwrap().is_dir()
             && d.file_name().to_str().unwrap().starts_with("test_data_set_")
         {
-            let (inputs, expected) = load_dataset(&d.path());
-            let inputs = inputs
-                .into_iter()
-                .enumerate()
-                .map(|(ix, i)| {
-                    let shape = plan
-                        .model()
-                        .input_fact(ix)
-                        .unwrap()
-                        .to_tensor_fact()
-                        .shape
-                        .as_concrete_finite()
-                        .unwrap()
-                        .unwrap();
-                    unsafe { i.into_shape(&shape).unwrap() }
-                })
-                .collect();
-            let expected: TVec<Tensor> = expected
-                .into_iter()
-                .enumerate()
-                .map(|(ix, i)| {
-                    let shape = plan
-                        .model()
-                        .output_fact(ix)
-                        .unwrap()
-                        .to_tensor_fact()
-                        .shape
-                        .as_concrete_finite()
-                        .unwrap()
-                        .unwrap();
-                    unsafe { i.into_shape(&shape).unwrap() }
-                })
-                .collect();
-            // println!("inputs: {:?}", inputs[0].dump(true));
-            let computed = plan.run(inputs).unwrap();
-            if computed.len() != expected.len() {
-                panic!(
-                    "For {:?}, different number of results: got:{} expected:{}",
-                    d.file_name(),
-                    computed.len(),
-                    expected.len()
-                );
-            }
-            for (ix, (a, b)) in computed.iter().zip(expected.iter()).enumerate() {
-                //                println!("computed: {:?}", computed[ix].dump(true));
-                //                println!("expected: {:?}", expected[ix].dump(true));
-                if !a.close_enough(b, true) {
-                    panic!(
-                        "For {:?}, different result for output #{}:\ngot:\n{:?}\nexpected:\n{:?}",
-                        d.file_name(),
-                        ix,
-                        a.cast_to::<f32>().unwrap().to_array_view::<f32>().unwrap(),
-                        b.cast_to::<f32>().unwrap().to_array_view::<f32>().unwrap(),
-                    )
+            let data_path = d.path();
+            let mut inputs = load_half_dataset("input", &data_path);
+            for setup in more {
+                if setup.starts_with("input:") {
+                    let input = setup.split(":").nth(1).unwrap();
+                    let mut actual_input = None;
+                    let input_outlets = model.input_outlets().unwrap().to_vec();
+                    for (ix, outlet) in input_outlets.iter().enumerate() {
+                        if model.node(outlet.node).name == input {
+                            actual_input = Some((outlet, inputs[ix].clone()));
+                        } else {
+                            model.node_mut(outlet.node).op =
+                                Box::new(tract_hir::ops::konst::Const::new(
+                                    inputs[ix].clone().into_arc_tensor(),
+                                ));
+                        }
+                    }
+                    let (outlet, value) = actual_input.unwrap_or_else(|| {
+                        panic!(
+                            "specified input: {}, input names: {:?}",
+                            setup,
+                            model
+                                .input_outlets()
+                                .unwrap()
+                                .iter()
+                                .map(|n| &model.node(n.node).name)
+                                .collect::<Vec<_>>()
+                        )
+                    });
+                    model.set_input_outlets(&[*outlet]).unwrap();
+                    inputs = tvec!(value);
                 }
             }
+            info!("Analyse");
+            trace!("Model:\n{:#?}", model);
+            model.analyse(false).unwrap();
+            info!("Incorporate");
+            let model = model.incorporate().unwrap();
+            info!("Test model (mode: {:?}) {:#?}", mode, path);
+            match mode {
+                Optim => {
+                    info!("Check full inference");
+                    if model.missing_type_shape().unwrap().len() != 0 {
+                        panic!("Incomplete inference {:?}", model.missing_type_shape());
+                    }
+                    info!("Into type");
+                    let model = model.into_typed().unwrap();
+                    let optimized = model.declutter().unwrap().optimize().unwrap();
+                    trace!("Run optimized model:\n{:#?}", optimized);
+                    run_model(optimized, inputs, &data_path)
+                }
+                Plain => {
+                    trace!("Run analysed model:\n{:#?}", model);
+                    run_model(model, inputs, &data_path)
+                }
+                NNEF => {
+                    let model = model.into_typed().unwrap();
+                    info!("Declutter");
+                    let optimized = model.declutter().unwrap();
+                    info!("Store to NNEF");
+                    let mut buffer = vec![];
+                    nnef.write_to_tar(&optimized, &mut buffer).unwrap();
+                    info!("Reload from NNEF");
+                    let reloaded = nnef.model_for_read(&mut &*buffer).unwrap();
+                    run_model(reloaded, inputs, &data_path)
+                }
+            }
+            info!("Test model (mode: {:?}) {:#?} OK.", mode, path);
+        }
+    }
+}
+
+fn run_model<F, O>(model: Graph<F, O>, inputs: TVec<Tensor>, data_path: &path::Path)
+where
+    F: Fact + Clone + 'static + Hash,
+    O: std::fmt::Debug + std::fmt::Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static + Hash,
+{
+    let plan = SimplePlan::new(&model).unwrap();
+    let expected = load_half_dataset("output", data_path);
+    trace!("Loaded output asserts: {:?}", expected);
+    let computed = plan.run(inputs).unwrap();
+    if computed.len() != expected.len() {
+        panic!(
+            "For {:?}, different number of results: got:{} expected:{}",
+            data_path,
+            computed.len(),
+            expected.len()
+        );
+    }
+    for (ix, (a, b)) in computed.iter().zip(expected.iter()).enumerate() {
+        use tract_hir::tract_core::error_chain::ChainedError;
+        //                println!("computed: {:?}", computed[ix].dump(true));
+        //                println!("expected: {:?}", expected[ix].dump(true));
+        if let Err(e) = a.close_enough(b, true) {
+            panic!(
+                "For {:?}, different result for output #{}:\ngot:\n{:?}\nexpected:\n{:?}\n{}",
+                data_path,
+                ix,
+                a.cast_to::<f32>().unwrap().to_array_view::<f32>().unwrap(),
+                b.cast_to::<f32>().unwrap().to_array_view::<f32>().unwrap(),
+                e.display_chain()
+            )
         }
     }
 }

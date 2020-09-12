@@ -1,56 +1,29 @@
 use std::fmt::{Debug, Display};
+#[allow(unused_imports)]
+use std::fs;
 
 use ansi_term::Color::*;
 
 use log::Level::Info;
 use tract_core::internal::*;
 
-use crate::display_graph::DisplayOptions;
-use crate::utils::*;
+use crate::display_params::DisplayParams;
 use crate::*;
 
 #[cfg(feature = "conform")]
 pub fn handle_tensorflow(
     cumulative: bool,
     resilient: bool,
-    mut params: Parameters,
-    output_params: DisplayOptions,
+    params: &mut Parameters,
+    output_params: DisplayParams,
 ) -> CliResult<()> {
-    {
-        let tf = params.tf_model.take().unwrap();
-        return match &params.tract_model {
-            SomeModel::Inference(m) => {
-                handle_tensorflow_t(cumulative, resilient, m, tf, &params, output_params)
-            }
-            SomeModel::Typed(m) => {
-                handle_tensorflow_t(cumulative, resilient, m, tf, &params, output_params)
-            }
-            SomeModel::Normalized(m) => {
-                handle_tensorflow_t(cumulative, resilient, m, tf, &params, output_params)
-            }
-            SomeModel::Pulsed(_, _) => panic!("Compare unsupported in pulse mode"),
-        };
-    }
-}
-
-#[cfg(feature = "conform")]
-fn handle_tensorflow_t<TI: TensorInfo, O>(
-    cumulative: bool,
-    resilient: bool,
-    tract: &Model<TI, O>,
-    mut tf: tract_tensorflow::conform::tf::Tensorflow,
-    params: &Parameters,
-    output_params: DisplayOptions,
-) -> CliResult<()>
-where
-    TI: TensorInfo + Clone + for<'a> From<&'a Tensor>,
-    O: AsRef<Op> + AsMut<Op> + Display + Debug + Clone,
-{
+    let tract = &params.tract_model;
+    let mut tf = params.tf_model.take().unwrap();
     // First generate random values for the inputs.
     let input_facts = tract
-        .input_outlets()?
+        .input_outlets()
         .iter()
-        .map(|&i| Ok(tract.outlet_fact(i)?.to_tensor_fact()))
+        .map(|&i| tract.outlet_typedfact(i))
         .collect::<TractResult<Vec<_>>>()?;
     let generated = crate::tensor::make_inputs(&*input_facts)?;
 
@@ -58,95 +31,147 @@ where
     info!("Running the model on tensorflow.");
     trace!("Inject inputs in tensorflow graph.");
     let pairs: Vec<_> = tract
-        .input_outlets()?
+        .input_outlets()
         .iter()
-        .map(|s| &*tract.node(s.node).name)
+        .map(|s| &*tract.node_name(s.node))
         .zip(generated.iter().cloned())
         .collect();
 
     trace!("Execute the model on tensorflow.");
-    let eval_order = ::tract_core::model::eval_order(&tract)?;
-    let nodes = tract.nodes();
+    let eval_order = tract.eval_order()?;
 
     let mut wanted_outputs: Vec<&str> = eval_order
         .iter()
-        .filter(|&n| !tract.input_outlets().unwrap().contains(&OutletId::new(*n, 0)))
-        .map(|&n| &*nodes[n].name)
+        .filter(|&n| !tract.input_outlets().contains(&OutletId::new(*n, 0)))
+        .map(|&n| tract.node_name(n))
         .collect();
 
-    for o in tract.output_outlets()? {
-        let name = &*tract.nodes()[o.node].name;
+    for o in tract.output_outlets() {
+        let name = &*tract.node_name(o.node);
         if !wanted_outputs.contains(&name) {
             wanted_outputs.push(name);
         }
     }
 
-    let mut all_values:HashMap<String, CliResult<TVec<Tensor>>> = HashMap::new();
+    let mut all_values: HashMap<String, CliResult<Tensor>> = HashMap::new();
     if resilient {
         for name in wanted_outputs {
-            all_values.insert(name.to_string(), tf.run(pairs.clone(), &name).map(|t| t.into()).map_err(|e| e.into()));
+            all_values.insert(
+                name.to_string(),
+                tf.run(pairs.clone(), &name).map(|t| t[0].clone().into()).map_err(|e| e.into()),
+            );
         }
     } else {
         tf.run_get_many(pairs, wanted_outputs)?.into_iter().for_each(|(k, v)| {
-            all_values.insert(k.to_string(), Ok(v.into()));
+            all_values.insert(k.to_string(), Ok(v[0].clone().into()));
         });
     };
 
-    for (ix, input) in tract.input_outlets()?.iter().enumerate() {
-        let name = &tract.node(input.node).name;
-        all_values.insert(name.to_string(), Ok(tvec!(generated[ix].clone())));
+    for (ix, input) in tract.input_outlets().iter().enumerate() {
+        let name = tract.node_name(input.node);
+        all_values.insert(name.to_string(), Ok(generated[ix].clone()));
     }
-    compare(cumulative, tract, &all_values, params, output_params)
+    dispatch_model_no_pulse!(params.tract_model, |m| compare(
+        cumulative,
+        m,
+        &all_values,
+        &params,
+        output_params
+    ))
 }
 
 pub fn handle_npz(
     cumulative: bool,
     npz: &str,
-    params: Parameters,
-    output_params: DisplayOptions,
-) -> CliResult<()> {
-    {
-        return match &params.tract_model {
-            SomeModel::Inference(m) => handle_npz_t(cumulative, m, npz, &params, output_params),
-            SomeModel::Typed(m) => handle_npz_t(cumulative, m, npz, &params, output_params),
-            SomeModel::Normalized(m) => handle_npz_t(cumulative, m, npz, &params, output_params),
-            SomeModel::Pulsed(_, _) => panic!("Compare unsupported in pulse mode"),
-        };
-    }
-}
-
-pub fn handle_npz_t<TI, O>(
-    cumulative: bool,
-    tract: &Model<TI, O>,
-    npz: &str,
     params: &Parameters,
-    output_params: DisplayOptions,
-) -> CliResult<()>
-where
-    TI: TensorInfo + Clone + for<'a> From<&'a Tensor>,
-    O: AsRef<Op> + AsMut<Op> + Display + Debug + Clone,
-{
+    output_params: &DisplayParams,
+) -> CliResult<()> {
     let mut npz = ndarray_npy::NpzReader::new(std::fs::File::open(npz)?)?;
     let mut values = HashMap::new();
     for name in npz.names()? {
-        if let Ok(value) = npz.by_name::<ndarray::OwnedRepr<f32>, ndarray::IxDyn>(&name) {
+        if let Ok(value) = tensor::for_npz(&mut npz, &name) {
             let name = name.trim_end_matches(".npy");
-            values.insert(name.to_string(), Ok(tvec!(value.into())));
+            values.insert(name.to_string(), Ok(value.into()));
         }
     }
-    compare(cumulative, tract, &values, params, output_params)
+    dispatch_model_no_pulse!(params.tract_model, |m| compare(
+        cumulative,
+        m,
+        &values,
+        &params,
+        output_params
+    ))
 }
 
-pub fn compare<TI, O>(
+#[cfg(feature = "onnx")]
+pub fn handle_pbdir(
     cumulative: bool,
-    tract: &Model<TI, O>,
-    all_values: &HashMap<String, CliResult<TVec<Tensor>>>,
+    pbdir: &str,
     params: &Parameters,
-    output_params: DisplayOptions,
+    output_params: &DisplayParams,
+) -> CliResult<()> {
+    let mut values: HashMap<String, CliResult<Tensor>> = HashMap::new();
+    for entry in fs::read_dir(pbdir)? {
+        use std::convert::TryInto;
+        let entry = entry?;
+        let file = fs::File::open(entry.path())?;
+        let tensor = tract_onnx::tensor::proto_from_reader(file)?;
+        values.insert(tensor.name.to_string(), Ok(tensor.try_into()?));
+    }
+    dispatch_model_no_pulse!(params.tract_model, |m| compare(
+        cumulative,
+        m,
+        &values,
+        &params,
+        output_params
+    ))
+}
+
+pub fn handle_reference_stage(
+    cumulative: bool,
+    params: &Parameters,
+    output_params: &DisplayParams,
+) -> CliResult<()> {
+    let reference_model =
+        params.reference_model.as_ref().ok_or("No reference model. need --with ?")?;
+    let reference_model = reference_model
+        .downcast_ref::<TypedModel>()
+        .ok_or("Only work with a typed reference model")?;
+    let mut values: HashMap<String, CliResult<Tensor>> = HashMap::new();
+
+    let plan = SimplePlan::new(reference_model)?;
+    let mut state = SimpleState::new(plan)?;
+    let input_facts = reference_model
+        .input_outlets()?
+        .iter()
+        .map(|&i| reference_model.outlet_fact(i))
+        .collect::<TractResult<Vec<_>>>()?;
+    let generated = crate::tensor::make_inputs(&*input_facts)?;
+    state.run_plan_with_eval(generated.clone(), |session, state, node, input| {
+        let result: TVec<Arc<Tensor>> = tract_core::plan::eval(session, state, node, input)?;
+        values.insert(node.name.clone(), Ok(result[0].as_ref().clone()));
+        Ok(result)
+    })?;
+    dispatch_model_no_pulse!(params.tract_model, |m| compare(
+        cumulative,
+        m,
+        &values,
+        params,
+        output_params
+    ))
+}
+
+pub fn compare<F, O>(
+    cumulative: bool,
+    tract: &Graph<F, O>,
+    all_values: &HashMap<String, CliResult<Tensor>>,
+    params: &Parameters,
+    output_params: &DisplayParams,
 ) -> CliResult<()>
 where
-    TI: TensorInfo + Clone + for<'a> From<&'a Tensor>,
-    O: AsRef<Op> + AsMut<Op> + Display + Debug + Clone,
+    F: Fact + Clone + for<'a> From<&'a Tensor> + Hash,
+    O: AsRef<dyn Op> + AsMut<dyn Op> + Display + Debug + Clone + Hash,
+    Graph<F, O>: Model,
 {
     let eval_order = ::tract_core::model::eval_order(&tract)?;
 
@@ -156,134 +181,109 @@ where
 
     for (ix, input) in tract.input_outlets()?.iter().enumerate() {
         let name = &tract.node(input.node).name;
-        let value = &all_values[name].as_ref().unwrap()[0];
+        let value = all_values[name].as_ref().unwrap();
         state.set_input(ix, value.clone())?;
     }
 
-    let mut display_graph =
-        crate::display_graph::DisplayGraph::from_model_and_options(tract.clone(), output_params)?
-            .with_graph_def(&params.graph)?;
+    let mut annotations = crate::annotations::Annotations::from_model(tract as &dyn Model)?
+        .with_graph_def(tract, &params.graph)?;
 
     let mut failing = vec![];
+    let mut ok = 0;
 
     for n in eval_order {
         let node = &tract.nodes()[n];
+        let mut ok_node = true;
 
-        let tf_output = match all_values.get(&*node.name) {
-            Some(Ok(it)) => it,
-            Some(Err(e)) => {
-                display_graph.set_node_color(n, Yellow)?;
-                display_graph.add_node_label(n, format!("{} {}", Yellow.paint("TF Error"), e))?;
-                continue;
-            },
-            None => {
-                display_graph.set_node_color(n, Yellow)?;
-                display_graph.add_node_label(n, Yellow.paint("Not in reference").to_string())?;
-                debug!("Skipping node (no reference) {}", node);
-                continue;
-            }
-        };
+        let mut tags = annotations.node_mut(n.into());
 
-        if node.op_is::<tract_core::ops::Source>() {
-            display_graph.set_node_color(n, Blue)?;
+        if tract.input_outlets()?.iter().any(|o| o.node == n) {
+            tags.style = Some(Blue.into());
         } else if node.op().validation() == Validation::Random {
-            display_graph.set_node_color(n, Blue)?;
-            display_graph.add_node_label(n, Blue.paint("Random").to_string())?;
+            tags.style = Some(Blue.into());
+            tags.labels.push(Blue.paint("Random").to_string());
         } else if node.op_is::<tract_core::ops::unimpl::UnimplementedOp>() {
-            display_graph.set_node_color(n, Red)?;
-            display_graph.add_node_label(n, Red.paint("Unimplemented").to_string())?;
+            tags.style = Some(Red.into());
+            tags.labels.push(Red.paint("Unimplemented").to_string());
             failing.push(n);
         } else {
             debug!("Computing {} in tract", node);
-            match state.compute_recursively(n) {
-                Err(e) => {
-                    failing.push(n);
-                    display_graph.add_node_label(n, format!("{}: {}", Red.paint("ERROR"), e))?;
-                }
-                _ => {
-                    // how many outputs are actually required ? ignore ancilliary
-                    // training wires from tensorflow op (fused batch norm)
-                    let wanted = node
-                        .outputs
-                        .iter()
-                        .enumerate()
-                        .position(|(ix, o)| {
-                            o.successors.len() == 0
-                                && !tract
-                                    .output_outlets()
-                                    .unwrap()
-                                    .contains(&OutletId::new(node.id, ix))
-                        })
-                        .unwrap_or(node.outputs.len());
-                    let expected: Vec<TensorFact> =
-                        tf_output.iter().take(wanted).map(|m| m.clone().into()).collect();
-                    let tract_output: &[Arc<Tensor>] = &*state.values[n].as_ref().unwrap();
-                    match check_outputs(&tract_output, &expected) {
-                        Err(e) => {
-                            failing.push(n);
-                            let inputs = tract.nodes()[n]
-                                .inputs
-                                .iter()
-                                .enumerate()
-                                .map(|(ix, o)| {
-                                    let tensor = &state.values[o.node].as_ref().unwrap()[o.slot];
-                                    format!("input value #{}: {:?}", ix, tensor)
-                                })
-                                .collect::<Vec<_>>();
-                            tract_output
-                                .iter()
-                                .enumerate()
-                                .try_for_each(|(ix, data)| -> CliResult<()> {
-                                    if ix >= tf_output.len() {
-                                        display_graph.set_node_color(n, Yellow)?;
-                                        display_graph.add_node_label(n, format!("Extra output (#{})", ix))?;
-                                    } else if tf_output[ix].shape() != data.shape() {
-                                        display_graph.set_node_color(n, Red.bold())?;
-                                        display_graph.add_node_label(n, format!("Output {} has wrong shape. Expected {:?}, got {:?}", ix, tf_output[ix].shape(), data.shape()))?;
-                                    } else if !tf_output[ix].close_enough(
-                                        data,
-                                        node.op().validation() == Validation::Rounding,
-                                    ) {
-                                        display_graph.set_node_color(n, Red.bold())?;
-                                        let mut msg = vec!(Red.bold().paint(format!("Wrong value for output {}", ix)).to_string());
-                                        msg.extend(inputs.iter().cloned());
-                                        msg.push(format!("expected: {:?}", tf_output[ix]));
-                                        msg.push(format!("got     : {:?}", data));
-                                        display_graph.add_node_section(n, msg)?;
-                                    } else {
-                                        display_graph.set_node_color(n, Red.bold())?;
-                                        display_graph.add_node_label(n, format!("{:?}", e))?;
-                                    };
-                                    Ok(())
-                                })?;
+            let error = state.compute_recursively(n).err();
+            let inputs = tract.nodes()[n]
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(ix, o)| {
+                    let tensor = &state.values[o.node].as_ref().and_then(|v| v.get(o.slot));
+                    format!("input value #{}: {:?}", ix, tensor)
+                })
+                .collect::<Vec<_>>();
+            if let Some(e) = error {
+                failing.push(n);
+                tags.style = Some(Red.into());
+                tags.labels.push(format!("{}: {}", Red.bold().paint("ERROR"), e));
+            } else {
+                for ix in 0..node.outputs.len() {
+                    let label = tract.outlet_label((n, ix).into()).unwrap_or(&node.name);
+                    if let Some(ref_value) = all_values.get(label) {
+                        match ref_value {
+                            Ok(t) => {
+                                let found = &state.values[n].as_ref().unwrap()[ix];
+                                if let Err(e) = found
+                                    .close_enough(t, node.op().validation() == Validation::Rounding)
+                                {
+                                    failing.push(n);
+                                    ok_node = false;
+                                    tags.style = Some(Red.bold());
+                                    let mut msg = vec![Red
+                                        .bold()
+                                        .paint(format!("Wrong value for output {}, {}", ix, e))
+                                        .to_string()];
+                                    msg.push(format!("got     : {:?}", found));
+                                    msg.push(format!("ref     : {:?}", t));
+                                    msg.push(format!("check   : {:?}", node.op().validation()));
+                                    tags.sections.push(msg);
+                                }
+                                if !cumulative {
+                                    // Use the output from reference to keep tract from drifting.
+                                    state.values[node.id].as_mut().unwrap()[ix] =
+                                        t.to_owned().into_arc_tensor();
+                                }
+                            }
+                            Err(e) => {
+                                failing.push(n);
+                                ok_node = false;
+                                tags.style = Some(Red.bold());
+                                tags.labels.push(format!("{}: {}", Red.bold().paint("ERROR"), e));
+                            }
                         }
-                        _ => {
-                            display_graph.set_node_color(n, Green)?;
-                        }
+                    } else {
+                        ok_node = false;
+                        tags.style = Some(Yellow.bold());
+                        tags.labels.push(Yellow.paint("Not matched against reference").to_string());
                     }
                 }
+                tags.sections.push(inputs);
+                if ok_node {
+                    tags.style = Some(Green.bold());
+                    ok += 1;
+                }
             }
-        }
-
-        if !cumulative {
-            // Use the output from tensorflow to keep tract from drifting.
-            trace!("copy tensorflow output in state: for node {}, {:?}", node.id, tf_output);
-            state.set_values(node.id, tf_output.clone().into())?;
         }
     }
 
     if log_enabled!(Info) {
-        display_graph.render()?;
+        terminal::render(tract, &annotations, &output_params)?;
     } else {
         for f in &failing {
-            display_graph.render_node(&tract.nodes()[*f])?;
+            terminal::render_node(tract, *f, &annotations, &output_params)?;
         }
     }
 
     if failing.len() > 0 {
         bail!("{} error(s).", failing.len())
     } else {
-        println!("{}", Green.paint("Each node passed the comparison."));
+        println!("{}", Green.paint(format!("{} node(s) passed the comparison.", ok)));
     };
     Ok(())
 }

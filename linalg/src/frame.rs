@@ -1,13 +1,18 @@
-pub mod conv;
-pub mod matmul;
+#[macro_use]
+pub mod lut;
+#[macro_use]
+pub mod mmm;
+pub mod pack_a;
 pub mod pack_b;
-pub mod vecmatmul;
+#[macro_use]
+pub mod sigmoid;
+#[macro_use]
+pub mod tanh;
 
+pub use pack_a::PackA;
 pub use pack_b::PackB;
 
-pub use self::conv::Conv;
-pub use self::conv::PackedConv;
-pub use self::matmul::MatMul;
-pub use self::matmul::PackedMatMul;
-pub use self::vecmatmul::PackedVecMatMul;
-pub use self::vecmatmul::VecMatMul;
+pub use self::mmm::{MatMatMul, MatMatMulImpl, QMatMatMul, QMatMatMulImpl};
+
+pub use self::sigmoid::SigmoidImpl;
+pub use self::tanh::TanhImpl;

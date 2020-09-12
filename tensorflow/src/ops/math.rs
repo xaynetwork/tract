@@ -1,44 +1,46 @@
-use tract_core::internal::*;
-use tract_core::ops as tractops;
+use tract_hir::internal::*;
+use tract_hir::ops;
 
-use crate::model::TfOpRegister;
-use crate::tfpb::node_def::NodeDef;
 use crate::model::ParsingContext;
+use crate::model::TfOpRegister;
+use crate::tfpb::tensorflow::NodeDef;
 
-
-mod max;
+mod reduce;
 
 pub fn register_all_ops(reg: &mut TfOpRegister) {
-    reg.insert("Abs", with_T!(tractops::math::Abs));
-    reg.insert("Add", with_T!(tractops::math::Add::Bin));
+    reg.insert("Abs", |_, _| Ok(Box::new(ops::math::abs())));
+    reg.insert("Add", |_, _| Ok(ops::math::Add.into_hir()));
     reg.insert("AddN", add_n);
-    reg.insert("BiasAdd", with_T!(tractops::math::Add::Bin));
-    reg.insert("Ceil", with_T!(tractops::math::Ceil));
-    reg.insert("Div", with_T!(tractops::math::Div::Bin));
-    reg.insert("FloorMod", with_T!(tractops::math::Rem::Bin));
+    reg.insert("AddV2", |_, _| Ok(ops::math::Add.into_hir()));
+    reg.insert("BiasAdd", |_, _| Ok(ops::math::Add.into_hir()));
+    reg.insert("Ceil", |_, _| Ok(Box::new(ops::math::ceil())));
+    reg.insert("Div", |_, _| Ok(ops::math::Div.into_hir()));
+    reg.insert("FloorMod", |_, _| Ok(ops::math::Rem.into_hir()));
     reg.insert("MatMul", mat_mul);
-    reg.insert("Max", max::max);
-    reg.insert("Maximum", with_T!(tractops::math::Max::Bin));
-    reg.insert("Minimum", with_T!(tractops::math::Min::Bin));
-    reg.insert("Less", with_T!(tractops::logic::Lesser::Bin));
-    reg.insert("Log", with_T!(tractops::math::Ln));
-    reg.insert("Mul", with_T!(tractops::math::Mul::Bin));
-    reg.insert("Pow", with_T!(tractops::math::Pow::Bin));
-    reg.insert("Neg", with_T!(tractops::math::Neg));
-    reg.insert("RealDiv", with_T!(tractops::math::Div::Bin));
-    reg.insert("Rsqrt", with_T!(tractops::math::Rsqrt));
-    reg.insert("Sub", with_T!(tractops::math::Sub::Bin));
-    reg.insert("Tanh", with_T!(tractops::math::Tanh));
+    reg.insert("Max", reduce::max);
+    reg.insert("Mean", reduce::mean);
+    reg.insert("Min", reduce::min);
+    reg.insert("Prod", reduce::prod);
+    reg.insert("Sum", reduce::sum);
+    reg.insert("Maximum", |_, _| Ok(ops::math::Max.into_hir()));
+    reg.insert("Minimum", |_, _| Ok(ops::math::Min.into_hir()));
+    reg.insert("Less", |_, _| Ok(ops::logic::Lesser.into_hir()));
+    reg.insert("Log", |_, _| Ok(Box::new(ops::math::ln())));
+    reg.insert("Mul", |_, _| Ok(ops::math::Mul.into_hir()));
+    reg.insert("Pow", |_, _| Ok(ops::math::Pow.into_hir()));
+    reg.insert("Neg", |_, _| Ok(Box::new(ops::math::neg())));
+    reg.insert("RealDiv", |_, _| Ok(ops::math::Div.into_hir()));
+    reg.insert("Rsqrt", |_, _| Ok(Box::new(ops::math::rsqrt())));
+    reg.insert("Sub", |_, _| Ok(ops::math::Sub.into_hir()));
+    reg.insert("Tanh", |_, _| Ok(Box::new(ops::math::tanh())));
 }
 
-pub fn add_n(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<InferenceOp>> {
-    let dtype = pb.get_attr_datum_type("T")?;
-    let n = pb.get_attr_int("N")?;
-    Ok(Box::new(tractops::math::AddN::new(dtype.into(), Some(n))))
+pub fn add_n(_ctx: &ParsingContext, _pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
+    Ok(Box::new(ops::binary::Nary(Box::new(ops::math::Add), false)))
 }
 
-pub fn mat_mul(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<InferenceOp>> {
+pub fn mat_mul(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let trans_a = pb.get_attr_bool("transpose_a")?;
     let trans_b = pb.get_attr_bool("transpose_b")?;
-    Ok(Box::new(tract_core::ops::math::Gemm::new(1.0, 0.0, trans_a, trans_b, false)))
+    Ok(Box::new(ops::matmul::MatMul::default().with_a_trans(trans_a).with_b_trans(trans_b)))
 }

@@ -1,7 +1,5 @@
 #!/bin/sh
 
-export CI=true
-
 set -ex
 
 if [ -z "$CACHEDIR" ]
@@ -10,4 +8,4 @@ then
 fi
 
 
-(cd tensorflow; cargo test --release --all --features conform)
+(cd tensorflow; cargo test --release --features conform)

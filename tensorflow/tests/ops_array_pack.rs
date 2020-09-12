@@ -3,24 +3,19 @@
 extern crate env_logger;
 #[macro_use]
 extern crate log;
-extern crate ndarray;
 #[macro_use]
 extern crate proptest;
-extern crate protobuf;
-extern crate tract_core;
 extern crate tract_tensorflow;
 
 mod utils;
 
 use crate::utils::*;
-use ndarray::prelude::*;
 use proptest::collection::vec;
 use proptest::prelude::*;
-use protobuf::Message;
-use tract_core::prelude::*;
 use tract_tensorflow::conform::*;
+use tract_tensorflow::prelude::*;
 use tract_tensorflow::tfpb;
-use tract_tensorflow::tfpb::types::DataType::DT_INT32;
+use tract_tensorflow::tfpb::tensorflow::DataType::DtInt32;
 
 fn strat() -> BoxedStrategy<(usize, Vec<Tensor>)> {
     // input rank
@@ -32,7 +27,7 @@ fn strat() -> BoxedStrategy<(usize, Vec<Tensor>)> {
             let mats: Vec<Tensor> = (0..n)
                 .map(|ix| {
                     Tensor::from(
-                        Array::from_shape_vec(dims.clone(), ((ix * 1000)..).take(size).collect())
+                        tract_ndarray::Array::from_shape_vec(dims.clone(), ((ix * 1000)..).take(size).collect())
                             .unwrap(),
                     )
                 })
@@ -50,7 +45,7 @@ proptest! {
         let mut pack = tfpb::node()
             .name("op")
             .op("Pack")
-            .attr("T", DT_INT32)
+            .attr("T", DtInt32)
             .attr("N", inputs.len() as i64)
             .attr("axis", axis as i64);
         for (ix,input) in inputs.iter().enumerate() {

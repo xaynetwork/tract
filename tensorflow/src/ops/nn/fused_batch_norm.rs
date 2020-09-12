@@ -1,47 +1,34 @@
-use tract_core::internal::*;
+use tract_hir::internal::*;
+use tract_hir::tract_core::itertools::izip;
 
-use crate::tfpb::node_def::NodeDef;
 use crate::model::ParsingContext;
+use crate::tfpb::tensorflow::NodeDef;
 
-pub fn fused_batch_norm(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<InferenceOp>> {
+pub fn fused_batch_norm(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let epsilon = pb.get_attr_float::<f32>("epsilon")?;
-    Ok(Box::new(FusedBatchNorm::new(epsilon)))
+    Ok(expand(FusedBatchNorm::new(epsilon)))
 }
 
-#[derive(Debug, Clone, new)]
+#[derive(Debug, Clone, new, Educe)]
+#[educe(Hash)]
 struct FusedBatchNorm {
+    #[educe(Hash(method = "hash_f32"))]
     epsilon: f32,
 }
 
-impl Op for FusedBatchNorm {
+tract_linalg::impl_dyn_hash!(FusedBatchNorm);
+
+impl Expansion for FusedBatchNorm {
     fn name(&self) -> Cow<str> {
-        "tf.FusedBatchNorm".into()
+        "FusedBatchNorm".into()
     }
 
     fn validation(&self) -> Validation {
         Validation::Rounding
     }
-}
 
-impl StatelessOp for FusedBatchNorm {
-    /// Evaluates the operation given the input tensors.
-    fn eval(&self, mut inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
-        let (data, scale, offset, mean, variance) = args_5!(inputs);
-        let mut data = data.into_tensor().into_array::<f32>()?;
-        let scale = scale.to_array_view::<f32>()?;
-        let offset = offset.to_array_view::<f32>()?;
-        let mean = mean.to_array_view::<f32>()?;
-        let variance = variance.to_array_view::<f32>()?;
-        let rsqrt_var = variance.mapv(|x| (x + self.epsilon).sqrt().recip());
-        data -= &mean;
-        data *= &rsqrt_var;
-        data *= &scale;
-        data += &offset;
-        Ok(tvec!(data.into_arc_tensor()))
-    }
-}
+    op_tf!();
 
-impl InferenceRulesOp for FusedBatchNorm {
     /// Registers the inference rules of the operator.
     fn rules<'r, 'p: 'r, 's: 'r>(
         &'s self,
@@ -50,12 +37,14 @@ impl InferenceRulesOp for FusedBatchNorm {
         outputs: &'p [TensorProxy],
     ) -> InferenceResult {
         check_input_arity(&inputs, 5)?;
+        check_output_arity(&outputs, 1)?;
         s.equals(&inputs[0].datum_type, f32::datum_type())?;
         s.equals(&inputs[1].datum_type, f32::datum_type())?;
         s.equals(&inputs[2].datum_type, f32::datum_type())?;
         s.equals(&inputs[3].datum_type, f32::datum_type())?;
         s.equals(&inputs[4].datum_type, f32::datum_type())?;
         s.equals(&outputs[0].datum_type, f32::datum_type())?;
+        s.equals(&outputs[0].shape, &inputs[0].shape)?;
         s.equals(&inputs[0].rank, 4)?;
         s.equals(&inputs[1].rank, 1)?;
         s.equals(&inputs[2].rank, 1)?;
@@ -69,5 +58,40 @@ impl InferenceRulesOp for FusedBatchNorm {
         Ok(())
     }
 
-    inference_op_as_op!();
+    fn wire(
+        &self,
+        prefix: &str,
+        target: &mut TypedModel,
+        inputs: &[OutletId],
+    ) -> TractResult<TVec<OutletId>> {
+        let scale = target.outlet_fact(inputs[1])?;
+        let offset = target.outlet_fact(inputs[2])?;
+        let mean = target.outlet_fact(inputs[3])?;
+        let variance = target.outlet_fact(inputs[4])?;
+        if let (Some(scale), Some(offset), Some(mean), Some(variance)) =
+            (&scale.konst, &offset.konst, &mean.konst, &variance.konst)
+        {
+            let scale = scale.as_slice::<f32>()?;
+            let offset = offset.as_slice::<f32>()?;
+            let mean = mean.as_slice::<f32>()?;
+            let variance = variance.as_slice::<f32>()?;
+            let slope: Vec<f32> =
+                izip!(variance, scale).map(|(v, s)| s / (v + self.epsilon).sqrt()).collect();
+            let inter: Vec<f32> = izip!(offset, mean, &slope).map(|(o, m, s)| o - m * s).collect();
+            let shape = tvec!(1, 1, 1, scale.len());
+            let slope = tensor1(&slope).into_shape(&shape)?;
+            let inter = tensor1(&inter).into_shape(&shape)?;
+            let wire = target.wire_node(
+                format!("{}.mul", prefix),
+                tract_hir::ops::math::mul::unary(slope.into_arc_tensor()),
+                &[inputs[0]],
+            )?;
+            return target.wire_node(
+                format!("{}.add", prefix),
+                tract_hir::ops::math::add::unary(inter.into_arc_tensor()),
+                &wire,
+            );
+        };
+        bail!("Batch norm parameters expected to be known")
+    }
 }

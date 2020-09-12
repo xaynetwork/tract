@@ -1,6 +1,6 @@
 #!/bin/sh
 
-set -ex
+set -e
 
 if [ -z "$CACHEDIR" ]
 then
@@ -12,5 +12,5 @@ mkdir -p $CACHEDIR
 cd $CACHEDIR
 for file in $@
 do
-    [ -e $file ] || wget -q https://s3.amazonaws.com/tract-ci-builds/tests/$file
+     [ -e $file ] || wget -q https://s3.amazonaws.com/tract-ci-builds/tests/$file
 done

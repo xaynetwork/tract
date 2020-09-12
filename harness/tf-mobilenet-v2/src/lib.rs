@@ -1,17 +1,15 @@
 #[cfg(features = "conform")]
 extern crate conform;
 extern crate image;
-extern crate ndarray;
-extern crate tract_core;
 extern crate tract_tensorflow;
 
 use std::{fs, path};
 
-use tract_core::prelude::*;
+use tract_tensorflow::prelude::*;
 
 fn download() {
-    use std::sync::{Once, ONCE_INIT};
-    static START: Once = ONCE_INIT;
+    use std::sync::Once;
+    static START: Once = std::sync::Once::new();
 
     START.call_once(|| do_download().unwrap());
 }
@@ -31,13 +29,6 @@ fn cachedir() -> path::PathBuf {
 pub fn load_labels() -> Vec<String> {
     fs::read_to_string(imagenet_slim_labels()).unwrap().lines().map(|s| s.into()).collect()
 }
-
-#[allow(dead_code)]
-fn mobilenet_v2() -> path::PathBuf {
-    download();
-    cachedir().join("mobilenet_v2_1.4_224_frozen.pb")
-}
-
 pub fn imagenet_slim_labels() -> path::PathBuf {
     download();
     cachedir().join("imagenet_slim_labels.txt")
@@ -49,9 +40,9 @@ pub fn grace_hopper() -> path::PathBuf {
 }
 
 pub fn load_image<P: AsRef<path::Path>>(p: P) -> Tensor {
-    let image = ::image::open(&p).unwrap().to_rgb();
-    let resized = ::image::imageops::resize(&image, 224, 224, ::image::FilterType::Triangle);
-    let image = ::ndarray::Array4::from_shape_fn((1, 224, 224, 3), |(_, y, x, c)| {
+    let image = image::open(&p).unwrap().to_rgb();
+    let resized = image::imageops::resize(&image, 224, 224, image::imageops::FilterType::Triangle);
+    let image = tract_ndarray::Array4::from_shape_fn((1, 224, 224, 3), |(_, y, x, c)| {
         resized[(x as _, y as _)][c] as f32 / 255.0
     })
     .into_dyn()
@@ -62,12 +53,16 @@ pub fn load_image<P: AsRef<path::Path>>(p: P) -> Tensor {
 #[cfg(test)]
 mod tests {
     extern crate dinghy_test;
-    use tract_core::ndarray::*;
-    use tract_core::prelude::*;
+    use tract_tensorflow::prelude::*;
 
     use super::*;
 
-    pub fn argmax(input: ArrayViewD<f32>) -> usize {
+    fn mobilenet_v2() -> path::PathBuf {
+        download();
+        cachedir().join("mobilenet_v2_1.4_224_frozen.pb")
+    }
+
+    pub fn argmax(input: tract_ndarray::ArrayViewD<f32>) -> usize {
         input
             .iter()
             .enumerate()
@@ -78,7 +73,7 @@ mod tests {
 
     #[test]
     fn plain() {
-        let tfd = ::tract_tensorflow::tensorflow().model_for_path(mobilenet_v2()).unwrap();
+        let tfd = tract_tensorflow::tensorflow().model_for_path(mobilenet_v2()).unwrap();
         let plan = SimplePlan::new(&tfd).unwrap();
         let input = load_image(grace_hopper());
         let outputs = plan.run(tvec![input]).unwrap();
@@ -90,8 +85,9 @@ mod tests {
 
     #[test]
     fn optimized() {
-        let mut tfd = ::tract_tensorflow::tensorflow().model_for_path(mobilenet_v2()).unwrap();
-        tfd.set_input_fact(0, TensorFact::dt_shape(f32::datum_type(), &[1, 224, 224, 3])).unwrap();
+        let mut tfd = tract_tensorflow::tensorflow().model_for_path(mobilenet_v2()).unwrap();
+        tfd.set_input_fact(0, InferenceFact::dt_shape(f32::datum_type(), &[1, 224, 224, 3]))
+            .unwrap();
         let tfd = tfd.into_optimized().unwrap();
         let plan = SimplePlan::new(&tfd).unwrap();
         let input = load_image(grace_hopper());

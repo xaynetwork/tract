@@ -3,39 +3,36 @@ use std::fmt;
 
 use downcast_rs::Downcast;
 
-use objekt;
+use dyn_clone;
 
 #[macro_use]
 pub mod macros;
+#[macro_use]
+pub mod element_wise;
+#[macro_use]
+pub mod binary;
+
+pub mod invariants;
 
 pub mod array;
 pub mod cast;
+pub mod change_axes;
 pub mod cnn;
+pub mod downsample;
+pub mod dummy;
 pub mod identity;
 pub mod konst;
 pub mod logic;
 pub mod math;
+pub mod matmul;
 pub mod nn;
+pub mod quant;
+pub mod scan;
 pub mod source;
 pub mod unimpl;
 
-pub use source::Source;
-
-pub fn check_input_arity(inputs: &[TensorProxy], expected: usize) -> TractResult<()> {
-    if inputs.len() != expected {
-        bail!("Wrong input number. Rules expect {}, node has {}.", expected, inputs.len())
-    } else {
-        Ok(())
-    }
-}
-
-pub fn check_output_arity(outputs: &[TensorProxy], expected: usize) -> TractResult<()> {
-    if outputs.len() != expected {
-        bail!("Wrong output number. Rules expect {}, node has {}.", expected, outputs.len())
-    } else {
-        Ok(())
-    }
-}
+pub use downsample::Downsample;
+pub use invariants::*;
 
 /// Level of precision to be expected in implementations comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,201 +42,272 @@ pub enum Validation {
     /// Implementation may induce rounding errors
     Rounding,
     /// Implementation must be accurate
-    Accurate
+    Accurate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum Cost {
+    Div(DatumType),
     FMA(DatumType),
+    Buffer(DatumType),
+    Params(DatumType),
+}
+
+impl Cost {
+    pub fn is_compute(&self) -> bool {
+        use Cost::*;
+        match self {
+            FMA(_) | Div(_) => true,
+            Buffer(_) | Params(_) => false,
+        }
+    }
 }
 
 use crate::internal::*;
 
-pub trait OpState: fmt::Debug + Send + objekt::Clone {
+pub trait OpState: fmt::Debug + Send + dyn_clone::DynClone {
     fn eval(
         &mut self,
         session: &mut SessionState,
-        op: &Op,
+        op: &dyn Op,
         inputs: TVec<Arc<Tensor>>,
     ) -> TractResult<TVec<Arc<Tensor>>>;
 }
+dyn_clone::clone_trait_object!(OpState);
 
-pub trait StatelessOp: Op {
-    fn eval(&self, inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>>;
-}
-
-pub trait StatefullOp {
-    fn state(&self, _session: &mut SessionState, node_id: usize) -> TractResult<Option<Box<OpState>>>;
-    fn as_stateless(&self) -> Option<&StatelessOp> {
-        None
+pub trait EvalOp {
+    #[allow(unused_variables)]
+    fn eval(&self, inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
+        bail!("stateless evaluation not implemented")
     }
-}
 
-impl<O: StatelessOp + Clone> StatefullOp for O {
-    fn state(&self, _session: &mut SessionState, _node_id: usize) -> TractResult<Option<Box<OpState>>> {
+    #[allow(unused_variables)]
+    fn state(
+        &self,
+        session: &mut SessionState,
+        node_id: usize,
+    ) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(None)
     }
 
-    fn as_stateless(&self) -> Option<&StatelessOp> {
-        Some(self)
-    }
+    fn is_stateless(&self) -> bool;
 }
 
 /// A base operation
 pub trait Op:
-    fmt::Debug + objekt::Clone + Send + Sync + 'static + Downcast + StatefullOp
+    fmt::Debug + dyn_clone::DynClone + Send + Sync + 'static + Downcast + EvalOp + DynHash
 {
+    /// Vector of short strings defining what families the op belongs too.
+    /// tract-core defines "core", "mir", "lir".
+    fn op_families(&self) -> &'static [&'static str];
+
     fn name(&self) -> Cow<str>;
 
-    fn declutter(
-        &self,
-        _model: &TypedModel,
-        _node: &TypedNode,
-    ) -> TractResult<Option<TypedModelPatch>> {
-        Ok(None)
-    }
-
-    fn pulsify(
-        &self,
-        _source: &NormalizedModel,
-        _node: &NormalizedNode,
-        _target: &mut PulsedModel,
-        _mapping: &HashMap<OutletId, OutletId>,
-    ) -> TractResult<TVec<OutletId>> {
-        bail!("Operator {} do not support pulsification", self.name())
-    }
-
-    fn codegen(
-        &self,
-        _model: &TypedModel,
-        _node: &TypedNode,
-    ) -> TractResult<Option<TypedModelPatch>> {
-        Ok(None)
-    }
-
-    fn cost(&self, _inputs: &[&TypedTensorInfo]) -> TractResult<TVec<(Cost, TDim)>> {
-        Ok(tvec!())
-    }
-
+    /// The kind of accuracy check that should be performed on operation when
+    /// testing them.
     fn validation(&self) -> Validation {
         Validation::Accurate
     }
 
-    fn same_as(&self, _other: &Op) -> bool {
+    /// Compare two ops.
+    // Should this one be and Eq or PartialEq impl instead ?
+    fn same_as(&self, _other: &dyn Op) -> bool {
         false
     }
 
-    fn info(&self) -> TractResult<Option<String>> {
-        Ok(None)
+    /// Short (one-line) strings giving hints on internal implementation or
+    /// important configuration details to be displayed in dumps.
+    fn info(&self) -> TractResult<Vec<String>> {
+        Ok(vec![])
     }
+
+    fn as_typed(&self) -> Option<&dyn TypedOp>;
 }
 
-
-/// An operation with tensor type inference
-pub trait InferenceOp:
-    Op + fmt::Debug + objekt::Clone + Send + Sync + 'static + Downcast + StatefullOp
+pub trait TypedOp:
+    Op + fmt::Debug + dyn_clone::DynClone + Send + Sync + 'static + Downcast + EvalOp + DynHash
 {
-    /// Infers properties about the input and output tensors.
-    ///
-    /// The `inputs` and `outputs` arguments correspond to properties about
-    /// the input and output tensors that are already known.
-    ///
-    /// Returns Err in case of an unrecoverable error during the inference,
-    /// and the refined properties about the inputs and outputs otherwise.
-    fn infer(
-        &self,
-        inputs: TVec<&TensorFact>,
-        outputs: TVec<&TensorFact>,
-    ) -> TractResult<(TVec<TensorFact>, TVec<TensorFact>)> {
-        let (infered_inputs, infered_outputs) = self.infer_facts(inputs, outputs)?;
+    /// Reinterpret the TypedOp as an Op.
+    fn as_op(&self) -> &dyn Op;
 
-        if self.as_op().downcast_ref::<crate::ops::source::Source>().is_some() {
-            return Ok((infered_inputs, infered_outputs))
-        }
+    /// Reinterpret the TypedOp as an Op, mutably.
+    fn as_op_mut(&mut self) -> &mut dyn Op;
 
-        if let Some(stateless) = self.as_stateless() {
-            if infered_inputs.iter().all(|i| i.value.is_concrete()) {
-                let input_values = infered_inputs
-                    .iter()
-                    .map(|i| i.value.concretize().unwrap().clone().into())
-                    .collect(); // checked
-                let output_values = stateless
-                    .eval(input_values)?
-                    .into_iter()
-                    .map(|t| t.into())
-                    .collect::<TVec<_>>();
-                return Ok((infered_inputs, output_values));
-            }
-        }
+    /// Deduce output facts from input facts.
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>>;
 
-        return Ok((infered_inputs, infered_outputs))
+    #[allow(unused_variables)]
+    fn invariants(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Invariants> {
+        Ok(Invariants::default())
     }
 
-    fn infer_facts(
-        &self,
-        inputs: TVec<&TensorFact>,
-        outputs: TVec<&TensorFact>,
-    ) -> TractResult<(TVec<TensorFact>, TVec<TensorFact>)>;
+    /// Fuse op after codegen to deal with local optimisations.
+    fn fuse(&self, _model: &TypedModel, _node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
+        Ok(None)
+    }
 
-    fn as_op(&self) -> &Op;
-    fn as_op_mut(&mut self) -> &mut Op;
+    /// Declutter the op to the tract_core operator set as much as possible.
+    #[allow(unused_variables)]
+    fn declutter(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+    ) -> TractResult<Option<TypedModelPatch>> {
+        Ok(None)
+    }
+
+    /// Computes a cost hint of the operation.
+    ///
+    /// Each pair is a type of operation and a number per call on eval.
+    fn cost(&self, _inputs: &[&TypedFact]) -> TractResult<TVec<(Cost, TDim)>> {
+        Ok(tvec!())
+    }
+
+    #[allow(unused_variables)]
+    fn suggested_axis_changes(&self) -> TractResult<TVec<(InOut, AxisOp)>> {
+        Ok(tvec!())
+    }
+
+    #[allow(unused_variables)]
+    fn change_axes(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+        io: InOut,
+        change: &AxisOp,
+    ) -> TractResult<Option<AxisChangeConsequence>> {
+        Ok(None)
+    }
+
+    #[allow(unused_variables)]
+    fn slice_output(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+        patch: &mut TypedModelPatch,
+        output_slot: usize,
+        axis: usize,
+        start: usize,
+        end: usize,
+    ) -> TractResult<Option<OutletId>> {
+        let outlet = OutletId::new(node.id, output_slot);
+        let output = model.outlet_fact(outlet)?;
+        if start == 0 && Some(end) == output.shape[axis].to_usize().ok() {
+            Ok(Some(patch.tap_model(model, outlet)?))
+        } else {
+            let wire = patch.tap_model(model, outlet)?;
+            let wire = patch.wire_node(
+                &format!("{}-{}-slice-{}-{}..{}", node.name, output_slot, axis, start, end),
+                crate::ops::array::Slice { start, axis, end },
+                &[wire],
+            )?[0];
+            Ok(Some(wire))
+        }
+    }
+
+    /// Transforms the op in an equivalent one, operating on dt (i8 or u8).
+    ///
+    /// Returns None if the op can not be translated.
+    #[allow(unused_variables)]
+    fn quantize(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+        dt: DatumType,
+        scale: f32,
+        zero_point: i32,
+    ) -> TractResult<Option<Box<dyn TypedOp>>> {
+        Ok(None)
+    }
+
+    /// Transform the op into by providing a value to one or more symbols.
+    #[allow(unused_variables)]
+    fn concretize_dims(
+        &self,
+        source: &TypedModel,
+        node: &TypedNode,
+        target: &mut TypedModel,
+        mapping: &HashMap<OutletId, OutletId>,
+        values: &SymbolValues,
+    ) -> TractResult<TVec<OutletId>> {
+        let inputs = node.inputs.iter().map(|i| mapping[i]).collect::<TVec<_>>();
+        target.wire_node(&node.name, node.op.clone(), &inputs)
+    }
+
+    /// Translate the op into the most efficient form possible for execution.
+    ///
+    /// This transformation is supposed to be final, no more pass are expected
+    /// to be run on the codegen networks.
+    #[allow(unused_variables)]
+    fn codegen(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+    ) -> TractResult<Option<TypedModelPatch>> {
+        Ok(None)
+    }
+
+    /// Nested model multipliers, with label (for profiling).
+    #[allow(unused_variables)]
+    fn nested_model_multipliers(&self, inputs: &[&TypedFact]) -> Vec<(Cow<str>, f64)> {
+        vec![]
+    }
 }
 
 impl_downcast!(Op);
 
-clone_trait_object!(Op);
-clone_trait_object!(StatelessOp);
-clone_trait_object!(InferenceOp);
+dyn_clone::clone_trait_object!(Op);
+dyn_clone::clone_trait_object!(TypedOp);
 
-impl<O: Op> From<O> for Box<Op> {
-    fn from(it: O) -> Box<Op> {
+impl<O: Op> From<O> for Box<dyn Op> {
+    fn from(it: O) -> Box<dyn Op> {
         Box::new(it)
     }
 }
 
-impl<O: InferenceOp> From<O> for Box<InferenceOp> {
-    fn from(it: O) -> Box<InferenceOp> {
+impl<O: TypedOp> From<O> for Box<dyn TypedOp> {
+    fn from(it: O) -> Box<dyn TypedOp> {
         Box::new(it)
     }
 }
 
-impl From<Box<InferenceOp>> for Box<Op> {
-    fn from(it: Box<InferenceOp>) -> Box<Op> {
-        objekt::clone_box(it.as_op())
+impl<'a> From<&'a Box<dyn TypedOp>> for Box<dyn TypedOp> {
+    fn from(it: &'a Box<dyn TypedOp>) -> Box<dyn TypedOp> {
+        it.clone()
     }
 }
 
-impl AsRef<Op> for InferenceOp {
-    fn as_ref(&self) -> &Op {
+impl AsRef<dyn Op> for dyn TypedOp {
+    fn as_ref(&self) -> &dyn Op {
         self.as_op()
     }
 }
 
-impl AsRef<Op> for Box<InferenceOp> {
-    fn as_ref(&self) -> &Op {
+impl AsRef<dyn Op> for Box<dyn TypedOp> {
+    fn as_ref(&self) -> &dyn Op {
         self.as_op()
     }
 }
 
-impl AsMut<Op> for InferenceOp {
-    fn as_mut(&mut self) -> &mut Op {
+impl AsMut<dyn Op> for dyn TypedOp {
+    fn as_mut(&mut self) -> &mut dyn Op {
         self.as_op_mut()
     }
 }
 
-impl AsMut<Op> for Box<InferenceOp> {
-    fn as_mut(&mut self) -> &mut Op {
+impl AsMut<dyn Op> for Box<dyn TypedOp> {
+    fn as_mut(&mut self) -> &mut dyn Op {
         self.as_op_mut()
     }
 }
 
-impl std::fmt::Display for Box<Op> {
+impl std::fmt::Display for Box<dyn Op> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "{}", self.name())
     }
 }
 
-impl std::fmt::Display for Box<InferenceOp> {
+impl std::fmt::Display for Box<dyn TypedOp> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "{}", self.name())
     }

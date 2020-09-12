@@ -1,13 +1,19 @@
-use tract_core::internal::*;
+use tract_hir::internal::*;
 
-use crate::model::TfOpRegister;
-use crate::tfpb::node_def::NodeDef;
 use crate::model::ParsingContext;
+use crate::model::TfOpRegister;
+use crate::tfpb::tensorflow::NodeDef;
 
-#[macro_use]
-mod macros;
+macro_rules! op_tf {
+    () => {
+        fn op_families(&self) -> &'static [&'static str] {
+            &["tf"]
+        }
+    };
+}
 
 pub mod array;
+pub mod control_flow;
 pub mod logic;
 pub mod math;
 pub mod nn;
@@ -18,6 +24,7 @@ pub mod vars;
 
 pub fn register_all_ops(reg: &mut TfOpRegister) {
     array::register_all_ops(reg);
+    control_flow::register_all_ops(reg);
     logic::register_all_ops(reg);
     math::register_all_ops(reg);
     nn::register_all_ops(reg);
@@ -27,17 +34,17 @@ pub fn register_all_ops(reg: &mut TfOpRegister) {
     vars::register_all_ops(reg);
     reg.insert("Cast", cast);
     reg.insert("Const", konst);
-    reg.insert("Identity", |_, _| Ok(Box::new(tract_core::ops::identity::Identity)));
+    reg.insert("Identity", |_, _| Ok(Box::new(tract_hir::ops::identity::Identity)));
     reg.insert("NoOp", |_, _| Ok(Box::new(Noop)));
-    reg.insert("Placeholder", |_, _| Ok(Box::new(::tract_core::ops::source::Source::new())));
+    reg.insert("Placeholder", |_, _| Ok(Box::new(tract_hir::ops::source::Source::new())));
 }
 
-fn cast(_ctx: &ParsingContext, node: &NodeDef) -> TractResult<Box<InferenceOp>> {
+fn cast(_ctx: &ParsingContext, node: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let dtype = node.get_attr_datum_type("DstT")?;
-    Ok(Box::new(::tract_core::ops::cast::Cast::new(dtype)))
+    Ok(Box::new(::tract_hir::ops::cast(dtype)))
 }
 
-fn konst(_ctx: &ParsingContext, node: &NodeDef) -> TractResult<Box<InferenceOp>> {
+fn konst(_ctx: &ParsingContext, node: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let dtype = node.get_attr_datum_type("dtype")?;
     let mat = node.get_attr_tensor("value")?;
 
@@ -45,19 +52,28 @@ fn konst(_ctx: &ParsingContext, node: &NodeDef) -> TractResult<Box<InferenceOp>>
         bail!("Const node {:?} doesn't have the expected {:?} type.", mat, dtype);
     }
 
-    Ok(Box::new(::tract_core::ops::konst::Const::for_tensor(mat)))
+    Ok(Box::new(::tract_hir::ops::konst::Const(mat.into())))
 }
 
-#[derive(Clone, Debug, new)]
+#[derive(Clone, Debug, new, Hash)]
 pub struct Noop;
+
+tract_linalg::impl_dyn_hash!(Noop);
 
 impl Op for Noop {
     fn name(&self) -> Cow<str> {
-        "tf.Noop".into()
+        "Noop".into()
     }
+
+    op_tf!();
+    op_as_typed_op!();
 }
 
-impl StatelessOp for Noop {
+impl EvalOp for Noop {
+    fn is_stateless(&self) -> bool {
+        true
+    }
+
     fn eval(&self, _inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
         Ok(tvec!(Tensor::from(false).into()))
     }
@@ -75,5 +91,14 @@ impl InferenceRulesOp for Noop {
         Ok(())
     }
 
-    inference_op_as_op!();
+    as_op!();
+    to_typed!();
+}
+
+impl TypedOp for Noop {
+    fn output_facts(&self, _inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        Ok(tvec!(TypedFact::dt_shape(bool::datum_type(), ())?))
+    }
+
+    as_op!();
 }

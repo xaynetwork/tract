@@ -1,18 +1,15 @@
-use tract_core::internal::*;
-use tract_core::ops::source::Source;
+use tract_hir::internal::*;
 
-use crate::display_graph;
-use crate::{CliResult, Parameters, SomeModel};
+use crate::display_params;
+use crate::{CliResult, Parameters};
 
-pub fn handle(params: Parameters, _options: display_graph::DisplayOptions) -> CliResult<()> {
-    let plain = params.unoptimized_model.unwrap();
-    let optimized = if let SomeModel::Typed(m) = params.tract_model {
-        m
-    } else {
-        bail!("Can only optimize-check typed models")
-    };
-
-    let generated = crate::tensor::make_inputs(&[plain.input_fact(0)?.to_tensor_fact()])?;
+pub fn handle(params: &Parameters, _options: display_params::DisplayParams) -> CliResult<()> {
+    let plain = params.decluttered_model.as_ref().unwrap().clone();
+    let optimized = params
+        .tract_model
+        .downcast_ref::<TypedModel>()
+        .expect("Can only optmize-check typed models");
+    let generated = crate::tensor::make_inputs(&[plain.input_fact(0)?])?;
 
     let original_plan = SimplePlan::new(plain)?;
     let mut original_state = SimpleState::new(original_plan)?;
@@ -27,7 +24,8 @@ pub fn handle(params: Parameters, _options: display_graph::DisplayOptions) -> Cl
             optimized_state.model().node_by_name(name).ok().map(|node| node.id)
         };
         if let Some(optim) = optim {
-            if original_state.model().nodes()[orig].op_is::<Source>() {
+            if original_state.model().nodes()[orig].op_is::<tract_core::ops::source::TypedSource>()
+            {
                 continue;
             }
             let orig_result: TVec<_> =
@@ -43,10 +41,11 @@ pub fn handle(params: Parameters, _options: display_graph::DisplayOptions) -> Cl
             }
 
             for (got, exp) in optim_result.iter().zip(orig_result.iter()) {
-                if !exp.close_enough(got, true) {
+                if let Err(e) = exp.close_enough(got, true) {
                     error!(
-                        "Values for {} are not close enough",
-                        original_state.model().nodes()[orig]
+                        "Values for {} are not close enough: {:?}",
+                        original_state.model().nodes()[orig],
+                        e
                     );
                     println!("{:?}\n", original_state.model().nodes()[orig]);
                     println!("{:?}\n", exp);

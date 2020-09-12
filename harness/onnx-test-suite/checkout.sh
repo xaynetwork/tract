@@ -2,21 +2,29 @@
 
 set -ex
 
-MY_DIR=`dirname $0`
-
 if [ -z "$CACHEDIR" ]
 then
     CACHEDIR=`dirname $0`/../../.cached
 fi
 
-mkdir -p $CACHEDIR
-cd $CACHEDIR
+mkdir -p $CACHEDIR/onnx
+cd $CACHEDIR/onnx
 
-if [ ! -e onnx ]
-then
-    (
-        git clone https://github.com/onnx/onnx ;
-        cd onnx
-        git checkout v1.4.1
-    )
-fi
+for version in 1.4.1 1.5.0
+do
+    if [ ! -e onnx-$version/onnx/backend/test/data ]
+    then
+        (
+            rm -rf onnx-$version
+            if [ `uname` = "Darwin" ] 
+            then
+                tmp=$(mktemp -d -t .)
+            else
+                tmp=$(mktemp -d -p .)
+            fi
+            git clone https://github.com/onnx/onnx $tmp
+            (cd $tmp ; git checkout v$version)
+            mv $tmp onnx-$version
+        )
+    fi
+done

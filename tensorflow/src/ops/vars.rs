@@ -1,23 +1,33 @@
-use tract_core::internal::*;
+use tract_hir::internal::*;
 
-use crate::model::{ ParsingContext, TfOpRegister };
-use crate::tfpb::node_def::NodeDef;
+use crate::model::{ParsingContext, TfOpRegister};
+use crate::tfpb::tensorflow::NodeDef;
 
 pub fn register_all_ops(reg: &mut TfOpRegister) {
     reg.insert("Assign", |_, _| Ok(Box::new(Assign::default())));
     reg.insert("VariableV2", variable_v2);
 }
 
-fn variable_v2(_ctx: &ParsingContext, node: &NodeDef) -> TractResult<Box<InferenceOp>> {
+fn variable_v2(_ctx: &ParsingContext, node: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let shared_name = node.get_attr_str("shared_name")?;
     let shared_name = if shared_name != "" { Some(shared_name) } else { None };
     let container = node.get_attr_str("container")?;
     let container = if container != "" { Some(container) } else { None };
-    let name = node.get_name().to_string();
+    let name = node.name.to_string();
     let id = format!("{:?}#{:?}#{}", container, shared_name, name);
     let shape = node.get_attr_shape("shape")?;
     let dt = node.get_attr_datum_type("dtype")?;
-    Ok(Box::new(VariableV2::new(container, shared_name, name, id, shape, dt)))
+    let shape = shape
+        .into_iter()
+        .map(|d| {
+            if d > 0 {
+                Ok(d as usize)
+            } else {
+                bail!("VariableV2 shape contains forbidden negative dim.")
+            }
+        })
+        .collect::<TractResult<TVec<usize>>>()?;
+    Ok(Box::new(VariableV2::new(container, shared_name, name, id, shape, dt, None)))
 }
 
 #[derive(Clone, Debug, new)]
@@ -27,7 +37,7 @@ impl OpState for VariableV2State {
     fn eval(
         &mut self,
         session: &mut SessionState,
-        op: &Op,
+        op: &dyn Op,
         _inputs: TVec<Arc<Tensor>>,
     ) -> TractResult<TVec<Arc<Tensor>>> {
         let op = op
@@ -41,7 +51,7 @@ impl OpState for VariableV2State {
     }
 }
 
-#[derive(Clone, Debug, new)]
+#[derive(Clone, Debug, new, Hash)]
 pub struct VariableV2 {
     container: Option<String>,
     shared_name: Option<String>,
@@ -49,21 +59,43 @@ pub struct VariableV2 {
     pub id: String,
     shape: TVec<usize>,
     dt: DatumType,
+    pub initializer: Option<Arc<Tensor>>,
 }
+
+tract_linalg::impl_dyn_hash!(VariableV2);
 
 impl Op for VariableV2 {
     fn name(&self) -> Cow<str> {
-        "tf.VariableV2".into()
+        "VariableV2".into()
     }
+
+    fn info(&self) -> TractResult<Vec<String>> {
+        if let Some(init) = &self.initializer {
+            Ok(vec![format!("Initialized to {:?}", init)])
+        } else {
+            Ok(vec![format!("Uninitialized")])
+        }
+    }
+
+    op_tf!();
+    op_as_typed_op!();
 }
 
-impl StatefullOp for VariableV2 {
-    fn state(&self, state: &mut SessionState, _node_id: usize) -> TractResult<Option<Box<OpState>>> {
-        fn make_buffer<T: Datum>(shape: &[usize]) -> Tensor {
-            ::ndarray::ArrayD::<T>::default(shape).into()
-        }
+impl EvalOp for VariableV2 {
+    fn is_stateless(&self) -> bool {
+        false
+    }
 
-        let tensor = dispatch_datum!(make_buffer(self.dt)(&self.shape));
+    fn state(
+        &self,
+        state: &mut SessionState,
+        _node_id: usize,
+    ) -> TractResult<Option<Box<dyn OpState>>> {
+        let tensor = if let Some(init) = &self.initializer {
+            init.clone().into_tensor()
+        } else {
+            unsafe { Tensor::uninitialized_dt(self.dt, &self.shape)? }
+        };
         state.tensors.insert(self.id.clone(), tensor);
         Ok(Some(Box::new(VariableV2State)))
     }
@@ -79,34 +111,48 @@ impl InferenceRulesOp for VariableV2 {
         check_input_arity(inputs, 0)?;
         check_output_arity(outputs, 1)?;
         s.equals(&outputs[0].datum_type, self.dt)?;
-        s.equals(&outputs[0].shape, ShapeFact::from(&*self.shape))?;
+        s.equals(&outputs[0].shape, ShapeFactoid::from(&*self.shape))?;
         Ok(())
     }
 
-    inference_op_as_op!();
+    as_op!();
+    to_typed!();
 }
 
-// need some dummy state to make sure Assign is a StatefullOp, and will not be
+impl TypedOp for VariableV2 {
+    as_op!();
+
+    fn output_facts(&self, _inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        Ok(tvec!(TypedFact::dt_shape(self.dt, &*self.shape)?))
+    }
+}
+
+// need some dummy state to make sure Assign is a EvalOp, and will not be
 // eval-ed() in Stateless context
 #[derive(Clone, Debug, new)]
 struct AssignState;
 
-#[derive(Clone, Debug, new, Default)]
+#[derive(Clone, Debug, new, Default, Hash)]
 pub struct Assign {
     pub var_id: Option<String>,
 }
 
+tract_linalg::impl_dyn_hash!(Assign);
+
 impl Op for Assign {
     fn name(&self) -> Cow<str> {
-        "tf.Assign".into()
+        "Assign".into()
     }
+
+    op_tf!();
+    op_as_typed_op!();
 }
 
 impl OpState for AssignState {
     fn eval(
         &mut self,
         session: &mut SessionState,
-        op: &Op,
+        op: &dyn Op,
         mut inputs: TVec<Arc<Tensor>>,
     ) -> TractResult<TVec<Arc<Tensor>>> {
         let (_current, new) = args_2!(inputs);
@@ -117,26 +163,31 @@ impl OpState for AssignState {
         } else {
             bail!("Assign has not been linked to var")
         };
-        fn assign<T: Datum>(
-            session: &mut SessionState,
-            var_id: &str,
-            t: &Tensor,
-        ) -> TractResult<()> {
-            session
-                .tensors
-                .get_mut(var_id)
-                .unwrap()
-                .to_array_view_mut::<T>()?
-                .assign(&t.to_array_view::<T>()?);
-            Ok(())
+        let store = session.tensors.get_mut(var_id).unwrap();
+        if cfg!(debug_assertions)
+            && (store.shape() != new.shape() && store.datum_type() != new.datum_type())
+        {
+            bail!(
+                "Invalid assignment to variable. Store is {:?}, assigned value is {:?}",
+                store,
+                new
+            );
         }
-        dispatch_datum!(assign(new.datum_type())(session, var_id, &new))?;
+        *store = new.clone().into_tensor();
         Ok(tvec!(new))
     }
 }
 
-impl StatefullOp for Assign {
-    fn state(&self, _state: &mut SessionState, _node_id: usize) -> TractResult<Option<Box<OpState>>> {
+impl EvalOp for Assign {
+    fn is_stateless(&self) -> bool {
+        false
+    }
+
+    fn state(
+        &self,
+        _state: &mut SessionState,
+        _node_id: usize,
+    ) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(AssignState)))
     }
 }
@@ -151,6 +202,7 @@ impl InferenceRulesOp for Assign {
         check_input_arity(inputs, 2)?;
         check_output_arity(outputs, 1)?;
         s.equals(&inputs[0].datum_type, &inputs[1].datum_type)?;
+        s.equals(&inputs[0].shape, &inputs[1].shape)?;
         s.equals(&outputs[0].datum_type, &inputs[0].datum_type)?;
         s.equals(&inputs[1].shape, &inputs[0].shape)?;
         s.equals(&outputs[0].shape, &inputs[0].shape)?;
@@ -158,51 +210,17 @@ impl InferenceRulesOp for Assign {
         Ok(())
     }
 
-    inference_op_as_op!();
+    as_op!();
+    to_typed!();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl TypedOp for Assign {
+    as_op!();
 
-    #[test]
-    fn var_assign() {
-        let mut model = Model::default();
-
-        let var = model
-            .add_node_default(
-                "var",
-                VariableV2::new(None, None, "var".into(), "xxx".into(), tvec![], f32::datum_type()),
-            )
-            .unwrap();
-        let zero = model.add_const("zero".to_string(), tensor0(0f32)).unwrap();
-        let one = model.add_const("one".to_string(), tensor0(1f32)).unwrap();
-        let reset = model.add_node_default("reset", Assign::new(Some("xxx".into()))).unwrap();
-        model.add_edge(OutletId::new(var, 0), InletId::new(reset, 0)).unwrap();
-        model.add_edge(OutletId::new(zero, 0), InletId::new(reset, 1)).unwrap();
-        let set = model.add_node_default("set", Assign::new(Some("xxx".into()))).unwrap();
-        model.add_edge(OutletId::new(var, 0), InletId::new(set, 0)).unwrap();
-        model.add_edge(OutletId::new(one, 0), InletId::new(set, 1)).unwrap();
-        let model = model.into_typed().unwrap();
-        let model = std::rc::Rc::new(model);
-        let var = model.node_by_name("var").unwrap().id;
-        let plan_read = SimplePlan::new_for_output(model.clone(), OutletId::new(var, 0)).unwrap();
-        let set = model.node_by_name("set").unwrap().id;
-        let plan_set = SimplePlan::new_for_output(model.clone(), OutletId::new(set, 0)).unwrap();
-        let reset = model.node_by_name("reset").unwrap().id;
-        let plan_reset =
-            SimplePlan::new_for_output(model.clone(), OutletId::new(reset, 0)).unwrap();
-        let mut state = SimpleState::new_multiplan(vec![plan_read, plan_set, plan_reset]).unwrap();
-
-        let read = state.run_plan(tvec!(), 0).unwrap(); // read
-        assert_eq!(read, tvec!(Tensor::from(0.0f32).into()));
-        let read = state.run_plan(tvec!(), 1).unwrap(); // set
-        assert_eq!(read, tvec!(Tensor::from(1.0f32).into()));
-        let read = state.run_plan(tvec!(), 0).unwrap(); // read
-        assert_eq!(read, tvec!(Tensor::from(1.0f32).into()));
-        let read = state.run_plan(tvec!(), 2).unwrap(); // reset
-        assert_eq!(read, tvec!(Tensor::from(0.0f32).into()));
-        let read = state.run_plan(tvec!(), 0).unwrap(); // read
-        assert_eq!(read, tvec!(Tensor::from(0.0f32).into()));
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        if inputs[0].datum_type != inputs[1].datum_type || inputs[0].shape != inputs[1].shape {
+            bail!("Invalid assignement {:?}", inputs);
+        }
+        Ok(tvec!(inputs[0].clone()))
     }
 }

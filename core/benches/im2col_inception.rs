@@ -5,11 +5,11 @@ extern crate tract_core;
 use criterion::Criterion;
 
 use tract_core::internal::*;
+use tract_core::ops::cnn::conv::Im2Col;
 use tract_core::ops::cnn::PaddingSpec;
 use tract_core::ops::cnn::PaddingSpec::SameUpper as Same;
 use tract_core::ops::cnn::PaddingSpec::Valid;
-
-use std::convert::TryInto;
+use tract_core::ops::{cnn, nn};
 
 fn b(
     c: &mut Criterion,
@@ -24,27 +24,34 @@ fn b(
     padding: PaddingSpec,
 ) {
     let image = Tensor::from(ndarray::Array4::<f32>::zeros((1, h, w, ci)));
-    let kernel = Tensor::from(ndarray::Array4::<f32>::zeros((kh, kw, ci, co)));
-    let conv = tract_core::ops::cnn::Conv::new(
-        tract_core::ops::nn::DataFormat::NHWC,
-        tract_core::ops::cnn::KernelFormat::HWIO,
-        None,
-        Some(kernel.shape()[0..2].into()),
-        padding,
-        Some(tvec!(stride, stride)),
-        1,
-    );
-    let input_fact: TypedTensorInfo =
-        TensorFact::dt_shape(DatumType::F32, image.shape()).try_into().unwrap();
-    let kernel_fact: TypedTensorInfo = TensorFact::from(kernel).try_into().unwrap();
-    let unary = conv.to_unary(&[&input_fact, &kernel_fact]).unwrap().unwrap();
-    let im2col =
-        unary.to_boxed_im2col_pair::<f32>(&*input_fact.shape.as_finite().unwrap()).unwrap().0;
-    assert_eq!(im2col.name(), "Im2col");
+    let kernel = Tensor::from(ndarray::Array4::<f32>::zeros((kh, kw, ci, co))).into_arc_tensor();
+    let unary = cnn::ConvUnary {
+        pool_spec: cnn::PoolSpec {
+            data_format: nn::DataFormat::NHWC,
+            kernel_shape: tvec!(kh, kw),
+            padding,
+            dilations: None,
+            strides: Some(tvec!(stride, stride)),
+            output_channel_override: None,
+        },
+        kernel_fmt: cnn::KernelFormat::HWIO,
+        kernel,
+        group: 1,
+        bias: None,
+        q_params: None,
+    };
+
+    let mut m = TypedModel::default();
+    let wire = m
+        .add_source("", TypedFact::dt_shape(f32::datum_type(), [1, h, w, ci].as_ref()).unwrap())
+        .unwrap();
+    unsafe {
+        unary.wire_as_im2col_pair(&mut m, "", wire, false).unwrap();
+    }
+    let im2col = m.node(1).op_as::<Im2Col<f32>>().unwrap();
     let args = tvec!(image.into());
     c.bench_function(name, move |b| {
-        let ref op = im2col.as_stateless().unwrap();
-        b.iter(|| op.eval(args.clone()).unwrap())
+        b.iter(|| im2col.eval(args.clone()).unwrap())
     });
 }
 

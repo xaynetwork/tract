@@ -1,0 +1,14 @@
+[package]
+name = "core-proptest-pulse"
+version = "0.1.0"
+authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
+edition = "2018"
+
+[dependencies]
+tract-pulse = { path = "../../pulse" }
+tract-hir = { path = "../../hir" }
+
+[dev-dependencies]
+log = "0.4"
+proptest = "0.10"
+env_logger = "0.7"

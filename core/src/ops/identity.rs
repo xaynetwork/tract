@@ -1,6 +1,6 @@
 use crate::internal::*;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 pub struct Identity;
 
 impl Op for Identity {
@@ -8,38 +8,39 @@ impl Op for Identity {
         "Identity".into()
     }
 
-    fn declutter(
-        &self,
-        model: &TypedModel,
-        node: &TypedNode,
-    ) -> TractResult<Option<TypedModelPatch>> {
-        let mut patch = TypedModelPatch::default();
-        let tap = patch.tap_model(model, node.inputs[0])?;
-        patch.shunt_outside(OutletId::new(node.id, 0), tap)?;
-        Ok(Some(patch))
-    }
+    op_core_mir!();
+    op_as_typed_op!();
 }
 
-impl StatelessOp for Identity {
+tract_linalg::impl_dyn_hash!(Identity);
+
+impl EvalOp for Identity {
+    fn is_stateless(&self) -> bool {
+        true
+    }
+
     /// Evaluates the operation given the input tensors.
     fn eval(&self, inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
         Ok(inputs)
     }
 }
 
-impl InferenceRulesOp for Identity {
-    fn rules<'r, 'p: 'r, 's: 'r>(
-        &'s self,
-        s: &mut Solver<'r>,
-        inputs: &'p [TensorProxy],
-        outputs: &'p [TensorProxy],
-    ) -> InferenceResult {
-        check_input_arity(&inputs, 1)?;
-        check_output_arity(&outputs, 1)?;
-        s.equals(&inputs[0].datum_type, &outputs[0].datum_type)?;
-        s.equals(&inputs[0].shape, &outputs[0].shape)?;
-        Ok(())
+impl TypedOp for Identity {
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        Ok(tvec!(inputs[0].clone()))
     }
 
-    inference_op_as_op!();
+    fn declutter(
+        &self,
+        model: &TypedModel,
+        node: &TypedNode,
+    ) -> TractResult<Option<TypedModelPatch>> {
+        Ok(Some(TypedModelPatch::shunt_one_op(model, node)?))
+    }
+
+    fn fuse(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
+        Ok(Some(TypedModelPatch::shunt_one_op(model, node)?))
+    }
+
+    as_op!();
 }

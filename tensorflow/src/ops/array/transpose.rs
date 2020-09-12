@@ -1,17 +1,20 @@
-use tract_core::internal::*;
-use crate::tfpb::node_def::NodeDef;
-use crate::model::ParsingContext;
+use tract_hir::internal::*;
 
-#[derive(Debug, Clone, new)]
+use crate::model::ParsingContext;
+use crate::tfpb::tensorflow::NodeDef;
+
+#[derive(Debug, Clone, new, Hash)]
 pub struct Transpose {
     t: DatumType,
     t_perm: DatumType,
 }
 
-pub fn transpose(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<InferenceOp>> {
+tract_linalg::impl_dyn_hash!(Transpose);
+
+pub fn transpose(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let t = pb.get_attr_datum_type("T")?;
     let t_perm = pb.get_attr_datum_type("Tperm")?;
-    Ok(Box::new(Transpose::new(t, t_perm)))
+    Ok(expand(Transpose::new(t, t_perm)))
 }
 
 impl Transpose {
@@ -22,47 +25,15 @@ impl Transpose {
         }
         new_shape
     }
-
-    fn eval_t<T: Datum>(
-        &self,
-        input: Arc<Tensor>,
-        perm: &[usize],
-    ) -> TractResult<TVec<Arc<Tensor>>> {
-        Ok(tvec![input.into_tensor().into_array::<T>()?.permuted_axes(perm).into_arc_tensor()])
-    }
 }
 
-impl Op for Transpose {
+impl Expansion for Transpose {
     fn name(&self) -> Cow<str> {
-        "tf.Transpose".into()
+        "Transpose".into()
     }
 
-    fn declutter(
-        &self,
-        model: &TypedModel,
-        node: &TypedNode,
-    ) -> TractResult<Option<TypedModelPatch>> {
-        let inputs = model.node_input_facts(node.id)?;
-        if let Some(ref perm) = inputs[1].konst {
-            let perm: Vec<usize> =
-                perm.cast_to::<i32>()?.as_slice::<i32>()?.iter().map(|&x| x as usize).collect();
-            let op = ::tract_core::ops::array::PermuteAxes::new(Some(perm));
-            return Ok(Some(TypedModelPatch::single_unary_op(&model, &node, op)?));
-        }
-        Ok(None)
-    }
-}
+    op_tf!();
 
-impl StatelessOp for Transpose {
-    fn eval(&self, mut inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
-        let (data, perm) = args_2!(inputs);
-        let perm: TVec<usize> =
-            perm.cast_to::<i32>()?.as_slice::<i32>()?.iter().map(|&x| x as usize).collect();
-        dispatch_datum!(Self::eval_t(data.datum_type())(self, data, &*perm))
-    }
-}
-
-impl InferenceRulesOp for Transpose {
     fn rules<'r, 'p: 'r, 's: 'r>(
         &'s self,
         s: &mut Solver<'r>,
@@ -84,5 +55,22 @@ impl InferenceRulesOp for Transpose {
         })
     }
 
-    inference_op_as_op!();
+    fn wire(
+        &self,
+        prefix: &str,
+        target: &mut TypedModel,
+        inputs: &[OutletId],
+    ) -> TractResult<TVec<OutletId>> {
+        if let Some(axes) = &target.outlet_fact(inputs[1])?.konst {
+            let axes: TVec<usize> =
+                axes.cast_to::<i64>()?.as_slice::<i64>()?.iter().map(|i| *i as usize).collect();
+            let mut wire = tvec!(inputs[0]);
+            for pair in tract_hir::tract_core::ops::change_axes::perm_to_ops(&axes) {
+                wire = target.wire_node(format!("{}.{:?}", prefix, pair), pair, &wire)?;
+            }
+            Ok(wire)
+        } else {
+            bail!("Expect permutation input to be const")
+        }
+    }
 }

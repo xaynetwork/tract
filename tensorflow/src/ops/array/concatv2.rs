@@ -1,58 +1,42 @@
-use ndarray::prelude::*;
-use tract_core::internal::*;
-use crate::tfpb::node_def::NodeDef;
 use crate::model::ParsingContext;
+use crate::tfpb::tensorflow::NodeDef;
+use tract_hir::internal::*;
 
-pub fn build(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<InferenceOp>> {
-    let n = pb.get_attr_int("N")?;
-    let t = pb.get_attr_datum_type("T")?;
-    let tidx = pb.get_attr_datum_type("Tidx")?;
-    Ok(boxed_new!(ConcatV2(t)(n, tidx)))
+pub fn build(_ctx: &ParsingContext, _pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
+    Ok(expand(ConcatV2))
 }
 
-#[derive(Debug, Clone, new)]
-pub struct ConcatV2<T: Copy + Datum> {
-    n: usize,
-    tidx: DatumType,
-    t: PhantomData<T>,
-}
+#[derive(Debug, Clone, new, Hash)]
+pub struct ConcatV2;
 
-impl<T: Copy + Datum> StatelessOp for ConcatV2<T> {
-    fn eval(&self, mut inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
-        let axis: i32 = *inputs.pop().unwrap().to_scalar::<i32>()?;
-        let mats: TractResult<Vec<ArrayViewD<T>>> =
-            inputs.iter().map(|mat| mat.to_array_view()).collect();
-        let result = ::ndarray::stack(Axis(axis as usize), &*mats?)?;
-        Ok(tvec![result.into_arc_tensor()])
-    }
-}
+tract_linalg::impl_dyn_hash!(ConcatV2);
 
-impl<T: Copy + Datum> Op for ConcatV2<T> {
+impl Expansion for ConcatV2 {
     fn name(&self) -> Cow<str> {
-        "tf.ConcatV2".into()
+        "ConcatV2".into()
     }
-}
 
-impl<T: Copy + Datum> InferenceRulesOp for ConcatV2<T> {
+    op_tf!();
+
     fn rules<'r, 'p: 'r, 's: 'r>(
         &'s self,
         s: &mut Solver<'r>,
         inputs: &'p [TensorProxy],
         outputs: &'p [TensorProxy],
     ) -> InferenceResult {
-        check_input_arity(&inputs, self.n + 1)?;
         check_output_arity(&outputs, 1)?;
-        s.equals_all((0..self.n).map(|i| (&inputs[i].datum_type).bex()).collect())?;
+        let n = inputs.len() - 1;
+        s.equals_all((0..n).map(|i| (&inputs[i].datum_type).bex()).collect())?;
         s.equals(&outputs[0].datum_type, &inputs[0].datum_type)?;
-        s.equals(&inputs[self.n].datum_type, DatumType::I32)?;
-        s.equals_all((0..self.n).map(|i| (&inputs[i].rank).bex()).collect())?;
-        s.equals(&inputs[self.n].rank, 0)?;
+        s.equals(&inputs[n].datum_type, DatumType::I32)?;
+        s.equals_all((0..n).map(|i| (&inputs[i].rank).bex()).collect())?;
+        s.equals(&inputs[n].rank, 0)?;
         s.equals(&outputs[0].rank, &inputs[0].rank)?;
-        s.given(&inputs[self.n].value, move |s, axis| {
+        s.given(&inputs[n].value, move |s, axis| {
             let axis = *axis.to_scalar::<i32>()? as usize;
             trace!("axis for ConcatV2: {}", axis);
             for d in 0..axis {
-                s.equals_all((0..self.n).map(|i| (&inputs[i].shape[d]).bex()).collect())?;
+                s.equals_all((0..n).map(|i| (&inputs[i].shape[d]).bex()).collect())?;
             }
             for d in 0..axis {
                 s.equals(&inputs[0].shape[d], &outputs[0].shape[d])?;
@@ -63,18 +47,35 @@ impl<T: Copy + Datum> InferenceRulesOp for ConcatV2<T> {
                     s.equals(&inputs[0].shape[d], &outputs[0].shape[d])?;
                 }
                 for d in (axis + 1)..(rank as usize) {
-                    s.equals_all((0..self.n).map(|i| (&inputs[i].shape[d]).bex()).collect())?;
+                    s.equals_all((0..n).map(|i| (&inputs[i].shape[d]).bex()).collect())?;
                 }
                 Ok(())
             })?;
 
             let mut concat_dim = -1 * outputs[0].shape[axis].bex();
-            for i in 0..self.n {
+            for i in 0..n {
                 concat_dim = concat_dim + inputs[i].shape[axis].bex();
             }
             s.equals_zero(concat_dim)
         })
     }
 
-    inference_op_as_op!();
+    fn wire(
+        &self,
+        prefix: &str,
+        model: &mut TypedModel,
+        inputs: &[OutletId],
+    ) -> TractResult<TVec<OutletId>> {
+        if let Some(ref axis) = model.outlet_fact(*inputs.last().unwrap())?.konst {
+            let axis = *axis.to_scalar::<i32>()? as usize;
+            let inputs = inputs.into_iter().copied().rev().skip(1).rev().collect::<TVec<_>>();
+            model.wire_node(
+                prefix,
+                tract_hir::tract_core::ops::array::TypedConcat::concat_vars(axis, inputs.len()),
+                &inputs,
+            )
+        } else {
+            bail!("Except axis to be a constant")
+        }
+    }
 }

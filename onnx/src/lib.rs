@@ -2,27 +2,36 @@
 #[macro_use]
 extern crate derive_new;
 #[macro_use]
-extern crate error_chain;
+extern crate educe;
 #[allow(unused_imports)]
 #[macro_use]
 extern crate log;
-extern crate ndarray;
 extern crate num_integer;
-extern crate num_traits;
-extern crate protobuf;
 #[allow(unused_imports)]
 #[macro_use]
-extern crate tract_core;
-extern crate tract_linalg;
+pub extern crate tract_hir;
 
 pub mod model;
 pub mod ops;
-pub mod pb;
+
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/prost/onnx.rs"));
+}
+
 pub mod pb_helpers;
 pub mod tensor;
 
 pub use model::Onnx;
-use tract_core::internal::*;
+
+pub use tract_hir::tract_core;
+pub mod prelude {
+    pub use crate::onnx;
+    pub use tract_onnx_opl::WithOnnx;
+    pub use tract_hir::prelude::*;
+}
+pub use tract_onnx_opl::WithOnnx;
+
+use tract_hir::prelude::*;
 
 #[deprecated(note = "Please use onnx().model_for_path(..)")]
 pub fn for_path(p: impl AsRef<std::path::Path>) -> TractResult<InferenceModel> {

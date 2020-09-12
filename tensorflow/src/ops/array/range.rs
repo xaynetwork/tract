@@ -1,16 +1,18 @@
-use ndarray::prelude::*;
-use num_traits::AsPrimitive;
-use std::ops::{Add, Div, Mul, Sub};
-use tract_core::internal::*;
-use crate::tfpb::node_def::NodeDef;
 use crate::model::ParsingContext;
+use crate::tfpb::tensorflow::NodeDef;
+use std::ops::{Add, Div, Mul, Sub};
+use tract_hir::internal::*;
+use tract_ndarray::prelude::*;
+use tract_num_traits::AsPrimitive;
 
-#[derive(Debug, Clone, new)]
+#[derive(Debug, Clone, new, Hash)]
 pub struct Range {
     dtype: DatumType,
 }
 
-pub fn range(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<InferenceOp>> {
+tract_linalg::impl_dyn_hash!(Range);
+
+pub fn range(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let dtype = pb.get_attr_datum_type("Tidx")?;
     Ok(Box::new(Range::new(dtype)))
 }
@@ -38,11 +40,18 @@ impl Range {
 
 impl Op for Range {
     fn name(&self) -> Cow<str> {
-        "tf.Range".into()
+        "Range".into()
     }
+
+    op_tf!();
+    not_a_typed_op!();
 }
 
-impl StatelessOp for Range {
+impl EvalOp for Range {
+    fn is_stateless(&self) -> bool {
+        true
+    }
+
     fn eval(&self, inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
         dispatch_numbers!(Self::eval_t(self.dtype)(self, inputs))
     }
@@ -68,5 +77,27 @@ impl InferenceRulesOp for Range {
         Ok(())
     }
 
-    inference_op_as_op!();
+    as_op!();
+
+    fn to_typed(
+        &self,
+        _source: &InferenceModel,
+        node: &InferenceNode,
+        target: &mut TypedModel,
+        mapping: &HashMap<OutletId, OutletId>,
+    ) -> TractResult<TVec<OutletId>> {
+        if let (Some(start), Some(limit), Some(delta)) = (
+            target.outlet_fact(mapping[&node.inputs[0]])?.konst.as_ref(),
+            target.outlet_fact(mapping[&node.inputs[1]])?.konst.as_ref(),
+            target.outlet_fact(mapping[&node.inputs[2]])?.konst.as_ref(),
+        ) {
+            let mut value = dispatch_numbers!(Self::eval_t(start.datum_type())(
+                self,
+                tvec!(start.clone(), limit.clone(), delta.clone())
+            ))?;
+            Ok(tvec!(target.add_const(&*node.name, value.remove(0))?))
+        } else {
+            bail!("Can not type Fill op")
+        }
+    }
 }

@@ -1,14 +1,21 @@
 use crate::internal::*;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct UnimplementedOp {
+    outputs: usize,
     name: String,
     message: String,
 }
 
+tract_linalg::impl_dyn_hash!(UnimplementedOp);
+
 impl UnimplementedOp {
-    pub fn new(name: impl AsRef<str>, message: impl AsRef<str>) -> UnimplementedOp {
-        UnimplementedOp { name: name.as_ref().to_string(), message: message.as_ref().to_string() }
+    pub fn new(outputs: usize, name: impl AsRef<str>, message: impl AsRef<str>) -> UnimplementedOp {
+        UnimplementedOp {
+            outputs,
+            name: name.as_ref().to_string(),
+            message: message.as_ref().to_string(),
+        }
     }
 }
 
@@ -16,23 +23,13 @@ impl Op for UnimplementedOp {
     fn name(&self) -> Cow<str> {
         format!("Unimplemented({})", self.name).into()
     }
+
+    op_core!();
+    not_a_typed_op!();
 }
 
-impl StatelessOp for UnimplementedOp {
-    fn eval(&self, _inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
-        bail!("unimplemented operation: {}", self.name)
+impl EvalOp for UnimplementedOp {
+    fn is_stateless(&self) -> bool {
+        false
     }
-}
-
-impl InferenceRulesOp for UnimplementedOp {
-    fn rules<'r, 'p: 'r, 's: 'r>(
-        &'s self,
-        _: &mut Solver<'r>,
-        _: &'p [TensorProxy],
-        _: &'p [TensorProxy],
-    ) -> InferenceResult {
-        Ok(())
-    }
-
-    inference_op_as_op!();
 }

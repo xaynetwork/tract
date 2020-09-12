@@ -2,8 +2,6 @@ use crate::internal::*;
 use crate::ops::cnn::PaddingSpec;
 use crate::ops::nn::{DataFormat, DataShape};
 use ndarray::prelude::*;
-#[cfg(not(debug_assertions))]
-use no_panic::no_panic;
 
 use super::PatchAxis;
 
@@ -12,7 +10,7 @@ use std::ops::Range;
 use itertools::zip;
 use itertools::Itertools;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct PatchSpec {
     pub input_shape: TVec<usize>,
     pub input_inner_stride: usize,
@@ -24,9 +22,12 @@ pub struct PatchSpec {
 }
 
 impl PatchSpec {
-    pub fn for_full_shape(data_format: DataFormat, input_full_shape: &[usize]) -> PatchSpec {
-        let shape = data_format.shape(input_full_shape.into());
-        Self::for_data_shape(shape)
+    pub fn for_full_shape(
+        data_format: DataFormat,
+        input_full_shape: &[usize],
+    ) -> TractResult<PatchSpec> {
+        let shape = data_format.shape(input_full_shape.into())?;
+        Ok(Self::for_data_shape(shape))
     }
 
     pub fn for_data_shape(data_shape: DataShape) -> PatchSpec {
@@ -165,8 +166,8 @@ impl PatchSpec {
         for ix in 0..self.input_shape.len() {
             let min_max = data_field_min_max[ix];
             let min = (-min_max.0 as usize).div_ceil(self.strides[ix]) as usize;
-            let max =
-                (self.input_shape[ix].saturating_sub(min_max.1 as usize)).div_ceil(self.strides[ix]) as usize;
+            let max = (self.input_shape[ix].saturating_sub(min_max.1 as usize))
+                .div_ceil(self.strides[ix]) as usize;
             if min != 0 {
                 let mut invalid = valid_output_zone.clone();
                 invalid.push(0..min);
@@ -209,7 +210,7 @@ impl PatchSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Patch {
     pub spec: PatchSpec,
     pub pad_before: TVec<usize>,
@@ -251,6 +252,9 @@ impl Patch {
 
     #[inline]
     pub fn visit_output(&self, mut acceptor: impl FnMut(&Scanner)) {
+        if self.zones.len() == 0 {
+            return;
+        }
         let mut scanner = Scanner::new(self);
         while !scanner.done() {
             acceptor(&scanner);
@@ -259,6 +263,9 @@ impl Patch {
     }
 
     pub fn centers_offsets(&self) -> Vec<isize> {
+        if self.zones.len() == 0 {
+            return vec![];
+        }
         let mut scanner = Scanner::new(self);
         let len = self.output_shape.iter().cloned().product();
         let mut v = Vec::with_capacity(len);
@@ -309,7 +316,7 @@ impl Patch {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub struct Zone {
     valid: bool,
     input_zone_offset: isize,
@@ -467,7 +474,6 @@ pub struct FastPatchIterator<'p> {
 impl<'p> Iterator for FastPatchIterator<'p> {
     type Item = Option<isize>;
     #[inline(always)]
-    #[cfg_attr(not(debug_assertions), no_panic)]
     fn next(&mut self) -> Option<Option<isize>> {
         if self.item == self.patch.standard_layout_data_field.len() {
             return None;
@@ -491,7 +497,6 @@ pub struct SafePatchIterator<'p> {
 
 impl<'p> Iterator for SafePatchIterator<'p> {
     type Item = Option<isize>;
-    #[cfg_attr(not(debug_assertions), no_panic)]
     fn next(&mut self) -> Option<Option<isize>> {
         unsafe {
             if self.item == self.patch.standard_layout_data_field.len() {
@@ -533,9 +538,10 @@ pub mod test {
         stride: usize,
     ) -> usize {
         let patch = PatchSpec::for_full_shape(NCHW, &[1, 1, input])
+            .unwrap()
             .with_dilations(tvec!(dilation))
             .with_kernel_shape(tvec!(kdim))
-            .with_padding(PaddingSpec::Explicit(tvec![pad_before], tvec![bad_after]))
+            .with_padding(PaddingSpec::Explicit(tvec![pad_before], tvec![bad_after], true))
             .with_strides(tvec![stride])
             .into_patch();
         patch.output_shape[0]
@@ -562,12 +568,12 @@ pub mod test {
     }
 
     fn field(kdim: &[usize], dilations: &[usize]) -> Array2<isize> {
-        let patch = PatchSpec::for_data_shape(NCHW.from_n_c_hw(1, 1, tvec![10; kdim.len()]))
-            .with_dilations(dilations.into())
-            .with_kernel_shape(kdim.into())
-            .with_padding(PaddingSpec::Explicit(tvec![0; kdim.len()], tvec![0; kdim.len()]))
-            .with_strides(tvec![1; kdim.len()])
-            .into_patch();
+        let patch =
+            PatchSpec::for_data_shape(NCHW.from_n_c_hw(1, 1, tvec![10; kdim.len()]).unwrap())
+                .with_dilations(dilations.into())
+                .with_kernel_shape(kdim.into())
+                .with_strides(tvec![1; kdim.len()])
+                .into_patch();
         patch.data_field
     }
 
@@ -595,8 +601,9 @@ pub mod test {
             })
             .prop_map(|((fmt, dil, c, ks, pad, strides), inp)| {
                 (
-                    fmt.shape(tvec!(1, c, inp.0, inp.1)),
+                    fmt.shape(tvec!(1, c, inp.0, inp.1)).unwrap(),
                     PatchSpec::for_full_shape(fmt, &[1, c, inp.0, inp.1])
+                        .unwrap()
                         .with_dilations(tvec!(dil.0, dil.1))
                         .with_kernel_shape(tvec!(ks.0, ks.1))
                         .with_padding(pad)
@@ -621,7 +628,7 @@ pub mod test {
         fn test_zoning((input_shape, p) in patch_2d()) {
             let valid_zone = &p.valid_output_zone;
             let invalid_zones = &p.invalid_output_zones;
-            let output_full_shape = input_shape.fmt.from_n_c_hw(*input_shape.n(), 1, &*p.output_shape);
+            let output_full_shape = input_shape.fmt.from_n_c_hw(input_shape.n().cloned().unwrap_or(1), 1, &*p.output_shape).unwrap();
             let h_axis = input_shape.h_axis();
             for coords in ndarray::indices(&*output_full_shape.shape) {
                 let inside_valid = in_zone(coords.slice(), h_axis, valid_zone);
@@ -639,12 +646,12 @@ pub mod test {
 
         #[test]
         fn test_zone_visitor((input_shape, p) in patch_2d()) {
-            let output_shape = input_shape.fmt.from_n_c_hw(*input_shape.n(), 1, &*p.output_shape);
+            let output_shape = input_shape.fmt.from_n_c_hw(input_shape.n().cloned().unwrap_or(1), 1, &*p.output_shape).unwrap();
             let mut output = ndarray::ArrayD::<i32>::zeros(&*output_shape.shape);
             let mut count = 0;
-            for n in 0..*output_shape.n() as isize {
+            for n in 0..*output_shape.n().unwrap_or(&1) as isize {
                 p.visit_output(|w| {
-                    let offset = (n * *output_shape.n_stride() as isize + w.output_offset) as usize;
+                    let offset = (n * *output_shape.n_stride().unwrap_or(&0) as isize + w.output_offset) as usize;
                     output.as_slice_mut().unwrap()[offset] = 1;
                     count += 1;
                 });
@@ -656,11 +663,12 @@ pub mod test {
     #[test]
     fn test_zone_visitor_1() {
         let p = PatchSpec::for_full_shape(DataFormat::NCHW, &[1, 1, 2, 2])
+            .unwrap()
             .with_kernel_shape(tvec![2, 1])
             .with_padding(PaddingSpec::SameLower)
             .with_strides(tvec![1, 2])
             .into_patch();
-        let output_shape = DataFormat::NCHW.from_n_c_hw(1, 1, &*p.output_shape);
+        let output_shape = DataFormat::NCHW.from_n_c_hw(1, 1, &*p.output_shape).unwrap();
         let mut output = ndarray::ArrayD::<i32>::zeros(&*output_shape.shape);
         let mut count = 0;
         p.visit_output(|w| {

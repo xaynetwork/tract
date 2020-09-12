@@ -1,0 +1,17 @@
+name: Native MacOS
+
+on:
+  push:
+  schedule:
+    - cron:  '0 3 * * *'
+
+jobs:
+  macos:
+    runs-on: macOS-latest
+
+    steps:
+    - uses: actions/checkout@v1
+    - name: Native script
+      run: .travis/native.sh
+      env:
+        SHORT: yes

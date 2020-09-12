@@ -2,15 +2,14 @@ use std::{fmt, ops};
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Default, PartialEq, PartialOrd, Debug)]
-#[cfg_attr(feature = "serialize", derive(Serialize))]
 pub struct f16(pub half::f16);
 
 macro_rules! binary_f16 {
     ($f:ident) => {
-        fn $f(self, other:f16) -> f16 {
+        fn $f(self, other: f16) -> f16 {
             (self.0).to_f32().$f((other.0).to_f32()).into()
         }
-    }
+    };
 }
 
 macro_rules! unary_as_f32 {
@@ -26,7 +25,7 @@ macro_rules! unary_f16 {
         fn $f(self) -> $t {
             (self.0).$f()
         }
-    }
+    };
 }
 
 macro_rules! const_f16 {
@@ -137,12 +136,6 @@ impl num_traits::ToPrimitive for f16 {
     }
 }
 
-impl num_traits::AsPrimitive<usize> for f16 {
-    fn as_(self) -> usize {
-        self.0.to_f32() as usize
-    }
-}
-
 impl num_traits::AsPrimitive<f32> for f16 {
     fn as_(self) -> f32 {
         self.0.to_f32()
@@ -175,10 +168,10 @@ impl num_traits::NumCast for f16 {
 
 impl num_traits::Bounded for f16 {
     fn min_value() -> f16 {
-        f16(half::consts::MIN)
+        f16(half::f16::MIN)
     }
     fn max_value() -> f16 {
-        f16(half::consts::MAX)
+        f16(half::f16::MAX)
     }
 }
 
@@ -186,6 +179,33 @@ impl ops::Neg for f16 {
     type Output = f16;
     fn neg(self) -> f16 {
         self.0.to_f32().neg().into()
+    }
+}
+
+impl num_traits::Signed for f16 {
+    fn abs(&self) -> Self {
+        use std::ops::Neg;
+        if self.is_negative() {
+            (*self).neg()
+        } else {
+            *self
+        }
+    }
+
+    fn abs_sub(&self, other: &Self) -> Self {
+        (*self - *other).abs()
+    }
+
+    fn signum(&self) -> Self {
+        f16(self.0.signum())
+    }
+
+    fn is_positive(&self) -> bool {
+        self.0.is_sign_positive()
+    }
+
+    fn is_negative(&self) -> bool {
+        self.0.is_sign_negative()
     }
 }
 
@@ -201,11 +221,37 @@ impl fmt::Display for f16 {
     }
 }
 
-impl num_traits::AsPrimitive<f16> for usize {
+impl num_traits::AsPrimitive<f16> for f16 {
     fn as_(self) -> f16 {
-        f16(half::f16::from_f64(self as f64))
+        self
     }
 }
+
+macro_rules! as_prim {
+    ($t: ty) => {
+        impl num_traits::AsPrimitive<f16> for $t {
+            fn as_(self) -> f16 {
+                f16(half::f16::from_f64(self as f64))
+            }
+        }
+        impl num_traits::AsPrimitive<$t> for f16 {
+            fn as_(self) -> $t {
+                self.0.to_f64() as _
+            }
+        }
+    };
+}
+
+as_prim!(isize);
+as_prim!(usize);
+as_prim!(i8);
+as_prim!(i16);
+as_prim!(i32);
+as_prim!(i64);
+as_prim!(u8);
+as_prim!(u16);
+as_prim!(u32);
+as_prim!(u64);
 
 impl ops::Add<f16> for f16 {
     type Output = f16;
@@ -214,9 +260,29 @@ impl ops::Add<f16> for f16 {
     }
 }
 
+impl ops::Add<&f16> for f16 {
+    type Output = f16;
+    fn add(self, other: &f16) -> f16 {
+        (self.0.to_f32() + other.0.to_f32()).into()
+    }
+}
+
+impl ops::AddAssign<f16> for f16 {
+    fn add_assign(&mut self, other: f16) {
+        *self = *self + other
+    }
+}
+
 impl ops::Sub<f16> for f16 {
     type Output = f16;
     fn sub(self, other: f16) -> f16 {
+        (self.0.to_f32() - other.0.to_f32()).into()
+    }
+}
+
+impl ops::Sub<&f16> for f16 {
+    type Output = f16;
+    fn sub(self, other: &f16) -> f16 {
         (self.0.to_f32() - other.0.to_f32()).into()
     }
 }
@@ -228,6 +294,13 @@ impl ops::Mul<f16> for f16 {
     }
 }
 
+impl ops::Mul<&f16> for f16 {
+    type Output = f16;
+    fn mul(self, other: &f16) -> f16 {
+        (self.0.to_f32() * other.0.to_f32()).into()
+    }
+}
+
 impl ops::Div<f16> for f16 {
     type Output = f16;
     fn div(self, other: f16) -> f16 {
@@ -235,9 +308,29 @@ impl ops::Div<f16> for f16 {
     }
 }
 
+impl ops::DivAssign<f16> for f16 {
+    fn div_assign(&mut self, other: f16) {
+        self.0 = half::f16::from_f32(self.0.to_f32() / other.0.to_f32())
+    }
+}
+
+impl ops::Div<&f16> for f16 {
+    type Output = f16;
+    fn div(self, other: &f16) -> f16 {
+        (self.0.to_f32() / other.0.to_f32()).into()
+    }
+}
+
 impl ops::Rem<f16> for f16 {
     type Output = f16;
     fn rem(self, other: f16) -> f16 {
+        (self.0.to_f32() % other.0.to_f32()).into()
+    }
+}
+
+impl ops::Rem<&f16> for f16 {
+    type Output = f16;
+    fn rem(self, other: &f16) -> f16 {
         (self.0.to_f32() % other.0.to_f32()).into()
     }
 }

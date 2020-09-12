@@ -3,23 +3,18 @@
 extern crate env_logger;
 #[macro_use]
 extern crate log;
-extern crate ndarray;
 #[macro_use]
 extern crate proptest;
-extern crate protobuf;
-extern crate tract_core;
 extern crate tract_tensorflow;
 
 mod utils;
 
 use crate::utils::*;
-use ndarray::prelude::*;
 use proptest::prelude::*;
-use protobuf::Message;
-use tract_core::prelude::*;
 use tract_tensorflow::conform::*;
+use tract_tensorflow::prelude::*;
 use tract_tensorflow::tfpb;
-use tract_tensorflow::tfpb::types::DataType::DT_FLOAT;
+use tract_tensorflow::tfpb::tensorflow::DataType::DtFloat;
 
 fn convolution_pb(
     v_stride: usize,
@@ -34,7 +29,7 @@ fn convolution_pb(
         .input("kernel")
         .attr("strides", vec![1, v_stride as i64, h_stride as i64, 1])
         .attr("padding", if valid { "VALID" } else { "SAME" })
-        .attr("T", DT_FLOAT);
+        .attr("T", DtFloat);
 
     let graph =
         tfpb::graph().node(placeholder_f32("data")).node(const_f32("kernel", kernel)).node(conv);
@@ -58,11 +53,11 @@ fn img_and_ker() -> BoxedStrategy<(Tensor, Tensor, (usize, usize))> {
         })
         .prop_map(|(img_shape, ker_shape, img, ker, strides)| {
             (
-                Array::from_vec(img.into_iter().map(|i| i as f32).collect())
+                tract_ndarray::Array::from(img.into_iter().map(|i| i as f32).collect::<Vec<_>>())
                     .into_shape(img_shape)
                     .unwrap()
                     .into(),
-                Array::from_vec(ker.into_iter().map(|i| i as f32).collect())
+                tract_ndarray::Array::from(ker.into_iter().map(|i| i as f32).collect::<Vec<_>>())
                     .into_shape(ker_shape)
                     .unwrap()
                     .into(),
@@ -94,8 +89,8 @@ proptest! {
 
 #[test]
 fn conv_infer_facts_1() {
-    let i: Tensor = ArrayD::<f32>::zeros(vec![1, 2, 2, 2]).into();
-    let k: Tensor = ArrayD::<f32>::zeros(vec![2, 2, 2, 1]).into();
+    let i: Tensor = tract_ndarray::ArrayD::<f32>::zeros(vec![1, 2, 2, 2]).into();
+    let k: Tensor = tract_ndarray::ArrayD::<f32>::zeros(vec![2, 2, 2, 1]).into();
     let model = convolution_pb(1, 1, false, &k).unwrap();
     infer(&model, vec![("data", i.into())], "conv").unwrap();
 }
@@ -153,6 +148,14 @@ fn conv_eval_7() {
     let i: Tensor = Tensor::from(arr4(&[[[[0.0f32]], [[0.0]], [[0.0]], [[1.0]]]]));
     let k: Tensor = Tensor::from(arr4(&[[[[0.0f32]]], [[[1.0]]]]));
     let model = convolution_pb(2, 1, false, &k).unwrap();
+    compare(&model, vec![("data", i.into())], "conv").unwrap();
+}
+
+#[test]
+fn conv_eval_8() {
+    let i: Tensor = Tensor::from(arr4(&[[[[0.0f32], [0.0]], [[0.0], [1.0]]]]));
+    let k: Tensor = Tensor::from(arr4(&[[[[1.0f32]]]]));
+    let model = convolution_pb(1, 1, false, &k).unwrap();
     compare(&model, vec![("data", i.into())], "conv").unwrap();
 }
 

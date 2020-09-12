@@ -9,8 +9,8 @@ use tensorflow::Graph;
 use tensorflow::Session;
 use tensorflow::SessionRunArgs;
 
-use ndarray::ArrayD;
-use tract_core::prelude::*;
+use tract_hir::internal::*;
+use tract_ndarray::prelude::*;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -74,23 +74,25 @@ impl From<Tensor> for TensorHolder {
             DatumType::I64 => TensorHolder::I64(Self::to_tensor(m.into_array().unwrap())),
             DatumType::U8 => TensorHolder::U8(Self::to_tensor(m.into_array().unwrap())),
             DatumType::U16 => TensorHolder::U16(Self::to_tensor(m.into_array().unwrap())),
+            DatumType::U32 => TensorHolder::U16(Self::to_tensor(m.into_array().unwrap())),
+            DatumType::U64 => TensorHolder::U16(Self::to_tensor(m.into_array().unwrap())),
             DatumType::TDim => {
                 let dims = m.to_array_view::<TDim>().unwrap();
-                if dims.iter().all(|d| d.to_integer().is_ok()) {
-                    let dims: ArrayD<i32> = dims.map(|d| d.to_integer().unwrap() as i32);
-                    TensorHolder::I32(Self::to_tensor(dims))
+                if let Ok(dims) = dims.iter().map(|d| d.to_i32()).collect::<TractResult<Vec<_>>>() {
+                    TensorHolder::I32(Self::to_tensor(arr1(&dims).into_dyn()))
                 } else {
                     panic!("Streaming used in tensorflow settings")
                 }
             }
             DatumType::String => TensorHolder::String(Self::to_tensor(m.into_array().unwrap())),
+            DatumType::Blob => TensorHolder::String(Self::to_tensor(m.into_array().unwrap())),
         }
     }
 }
 
 fn tensor_to_array<T: ::tensorflow::TensorType>(tensor: &tf::Tensor<T>) -> Result<ArrayD<T>> {
     let shape: Vec<usize> = tensor.dims().iter().map(|d| *d as _).collect();
-    Ok(::ndarray::Array::from_iter(tensor.iter().cloned()).into_shape(shape)?)
+    Ok(Array::from(tensor.into_iter().cloned().collect::<Vec<_>>()).into_shape(shape)?)
 }
 
 impl Tensorflow {
@@ -121,7 +123,7 @@ impl Tensorflow {
         let tokens =
             (0..op.num_outputs()).map(|ix| step.request_fetch(&op, ix as i32)).collect::<Vec<_>>();
 
-        let session = Session::new(&::tensorflow::SessionOptions::new(), &self.graph)?;
+        let mut session = Session::new(&::tensorflow::SessionOptions::new(), &self.graph)?;
         session.run(&mut step)?;
 
         tokens
@@ -199,7 +201,7 @@ impl Tensorflow {
         trace!("{:?}", tokens);
 
         // Execute the graph using tensorflow.
-        let session = Session::new(&::tensorflow::SessionOptions::new(), &self.graph)?;
+        let mut session = Session::new(&::tensorflow::SessionOptions::new(), &self.graph)?;
         session.run(&mut step)?;
         trace!("Tensorflow ran succesfully");
 
@@ -231,13 +233,7 @@ fn convert_output(
     macro_rules! convert {
         ($dt:ident) => {
             match step.fetch(output) {
-                Err(r) => {
-                    if r.code() == tensorflow::Code::InvalidArgument {
-                        unsafe { Tensor::null::<$dt>(&[]).unwrap().into() }
-                    } else {
-                        Err(r)?
-                    }
-                }
+                Err(r) => Err(r)?,
                 Ok(output) => tensor_to_array::<$dt>(&output)?.into(),
             }
         };

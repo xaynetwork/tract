@@ -5,20 +5,27 @@ use std::fmt::{Debug, Display};
 
 /// Find an evaluation order for a model, using its default inputs and outputs
 /// as boundaries.
-pub fn eval_order<TI: TensorInfo, O: Debug + Display + AsRef<Op> + AsMut<Op>>(
-    model: &super::Model<TI, O>,
-) -> TractResult<Vec<usize>> {
+pub fn eval_order<F, O>(model: &super::Graph<F, O>) -> TractResult<Vec<usize>>
+where
+    F: Fact + Hash + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static + Hash,
+{
     let inputs = model.input_outlets()?.iter().map(|n| n.node).collect::<Vec<usize>>();
     let targets = model.output_outlets()?.iter().map(|n| n.node).collect::<Vec<usize>>();
-    eval_order_for_nodes(model.nodes(), &inputs, &targets)
+    eval_order_for_nodes(model.nodes(), &inputs, &targets, &[])
 }
 
 /// Find a working evaluation order for a list of nodes.
-pub fn eval_order_for_nodes<TI: TensorInfo, O: Debug + Display + AsRef<Op> + AsMut<Op>>(
-    nodes: &[BaseNode<TI, O>],
+pub fn eval_order_for_nodes<F, O>(
+    nodes: &[BaseNode<F, O>],
     inputs: &[usize],
     targets: &[usize],
-) -> TractResult<Vec<usize>> {
+    more_dependencies: &[(usize, usize)],
+) -> TractResult<Vec<usize>>
+where
+    F: Fact + Hash + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static + Hash,
+{
     let mut done = bit_set::BitSet::with_capacity(nodes.len());
     let mut order: Vec<usize> = vec![];
     for &target in targets {
@@ -28,18 +35,23 @@ pub fn eval_order_for_nodes<TI: TensorInfo, O: Debug + Display + AsRef<Op> + AsM
         let mut current_stack: Vec<(usize, usize)> = vec![(target, 0)];
         let mut pending = bit_set::BitSet::with_capacity(nodes.len());
         while let Some((current_node, current_input)) = current_stack.pop() {
-            if inputs.contains(&current_node)
-                || current_input
-                    == nodes[current_node].inputs.len() + nodes[current_node].control_inputs.len()
-            {
+            let deps_from_inputs = nodes[current_node].inputs.len();
+            let all_deps_count =
+                deps_from_inputs + more_dependencies.iter().filter(|a| a.0 == current_node).count();
+            if inputs.contains(&current_node) || current_input == all_deps_count {
                 order.push(current_node);
                 done.insert(current_node);
                 pending.remove(current_node);
             } else {
-                let precursor = if current_input < nodes[current_node].inputs.len() {
+                let precursor = if current_input < deps_from_inputs {
                     nodes[current_node].inputs[current_input].node
                 } else {
-                    nodes[current_node].control_inputs[current_input- nodes[current_node].inputs.len()]
+                    more_dependencies
+                        .iter()
+                        .filter(|a| a.0 == current_node)
+                        .nth(current_input - deps_from_inputs)
+                        .unwrap()
+                        .1
                 };
                 if done.contains(precursor) {
                     current_stack.push((current_node, current_input + 1));
@@ -66,35 +78,41 @@ pub fn eval_order_for_nodes<TI: TensorInfo, O: Debug + Display + AsRef<Op> + AsM
 #[cfg(test)]
 mod tests {
     use crate::internal::*;
-    use crate::ops::math::Add;
+    use crate::ops::math;
 
     #[test]
     fn simple() {
-        let mut model = Model::default();
-        model.add_source_default("a").unwrap();
-        model.chain_default("add", Add::default()).unwrap();
-        model.add_const("b", Tensor::from(12.0f32)).unwrap();
-        model.add_edge(OutletId::new(2, 0), InletId::new(1, 1)).unwrap();
-        assert_eq!(model.eval_order().unwrap(), vec!(0, 2, 1));
+        let mut model = TypedModel::default();
+        let a = model
+            .add_source("a", TypedFact::dt_shape(f32::datum_type(), [1].as_ref()).unwrap())
+            .unwrap();
+        let b = model.add_const("b", tensor1(&[12.0f32])).unwrap();
+        let add = model.wire_node("add", math::add::bin_typed(), &[a, b]).unwrap()[0];
+        model.auto_outputs().unwrap();
+        assert_eq!(model.eval_order().unwrap(), vec!(a.node, b.node, add.node));
     }
 
     #[test]
     fn diamond() {
-        let mut model = Model::default();
-        model.add_source_default("a").unwrap();
-        model.chain_default("add", Add::default()).unwrap();
-        model.add_edge(OutletId::new(0, 0), InletId::new(1, 1)).unwrap();
-        assert_eq!(model.eval_order().unwrap(), vec!(0, 1));
+        let mut model = TypedModel::default();
+        let a = model
+            .add_source("a", TypedFact::dt_shape(f32::datum_type(), [1].as_ref()).unwrap())
+            .unwrap();
+        let add = model.wire_node("add", math::add::bin_typed(), &[a, a]).unwrap()[0];
+        model.auto_outputs().unwrap();
+        assert_eq!(model.eval_order().unwrap(), vec!(a.node, add.node));
     }
 
     #[test]
     fn dodge_loop() {
-        let mut model = Model::default();
-        model.add_source_default("a").unwrap();
-        let add = model.chain_default("add", Add::default()).unwrap();
-        let neg = model.chain_default("neg", Add::default()).unwrap();
-        model.add_edge(OutletId::new(neg, 0), InletId::new(add, 1)).unwrap();
-        model.set_output_outlets(&tvec!(OutletId::new(neg, 0))).unwrap();
+        let mut model = TypedModel::default();
+        let a = model
+            .add_source("a", TypedFact::dt_shape(f32::datum_type(), [1].as_ref()).unwrap())
+            .unwrap();
+        let add = model.wire_node("add", math::add::bin_typed(), &[a, a]).unwrap()[0];
+        let neg = model.wire_node("neg", math::add::bin_typed(), &[add, a]).unwrap()[0];
+        model.add_edge(neg, InletId::new(add.node, 1)).unwrap();
+        model.set_output_outlets(&[neg]).unwrap();
         let (rx, tx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             rx.send(model.eval_order()).unwrap();

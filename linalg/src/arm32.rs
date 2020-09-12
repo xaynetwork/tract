@@ -1,9 +1,11 @@
 use std::{env, fs};
 mod armv7neon;
 mod armvfpv2;
+use crate::frame::MatMatMulImpl;
+use crate::frame::QMatMatMulImpl;
+use crate::frame::SigmoidImpl;
+use crate::frame::TanhImpl;
 
-use crate::frame::PackedConv;
-use crate::frame::PackedMatMul;
 use crate::Ops;
 
 fn has_neon_cpuinfo() -> std::io::Result<bool> {
@@ -22,22 +24,35 @@ fn has_neon() -> bool {
 
 pub fn plug(ops: &mut Ops) {
     if has_neon() {
-        ops.smm = Box::new(|m, k, n| {
-            log::info!("armv7neon activated for smm");
-            Box::new(PackedMatMul::<armv7neon::SMatMul8x4, f32>::new(m, k, n))
+        log::info!("armv7neon activated (smmm, ssigmoid), stanh)");
+        ops.mmm_f32 = Box::new(|m, k, n| {
+            Box::new(MatMatMulImpl::<armv7neon::MatMatMulF32x8x4, f32, f32, f32, f32>::new(m, k, n))
         });
-        ops.sconv = Box::new(|m, k, n| {
-            log::info!("arm7neon activated for sconv");
-            Box::new(PackedConv::<armv7neon::SConv8x4, f32>::new(m, k, n))
+        ops.qmmm_i8_i8 = Box::new(|m, k, n| {
+            Box::new(QMatMatMulImpl::from(MatMatMulImpl::<
+                armv7neon::MatMatMulI8x8x4,
+                i8,
+                i8,
+                i8,
+                i32,
+            >::new(m, k, n)))
         });
+        ops.qmmm_i8_i32 = Box::new(|m, k, n| {
+            Box::new(QMatMatMulImpl::from(MatMatMulImpl::<
+                armv7neon::MatMatMulI8xI32x8x4,
+                i8,
+                i8,
+                i32,
+                i32,
+            >::new(m, k, n)))
+        });
+        ops.sigmoid_f32 =
+            Box::new(|| Box::new(SigmoidImpl::<armv7neon::SigmoidF32x4n, f32>::new()));
+        ops.tanh_f32 = Box::new(|| Box::new(TanhImpl::<armv7neon::TanhF32x4n, f32>::new()));
     } else {
-        ops.smm = Box::new(|m, k, n| {
-            log::info!("armvfpv2 activated for smm");
-            Box::new(PackedMatMul::<armvfpv2::SMatMul4x4, f32>::new(m, k, n))
-        });
-        ops.sconv = Box::new(|m, k, n| {
-            log::info!("armvfpv2 activated for sconv");
-            Box::new(PackedConv::<armvfpv2::SConv4x4, f32>::new(m, k, n))
+        log::info!("armvfpv2 activated for smmm");
+        ops.mmm_f32 = Box::new(|m, k, n| {
+            Box::new(MatMatMulImpl::<armvfpv2::MatMatMulF32x4x4, f32, f32, f32, f32>::new(m, k, n))
         });
     }
 }
@@ -48,10 +63,9 @@ mod tests {
 
     #[test]
     fn may_have_neon() {
+        println!("Has neon ? {:?}", has_neon());
         if let Ok(neon) = env::var("TRACT_CPU_EXPECT_ARM32_NEON") {
             assert_eq!(neon == "true", has_neon());
-        } else {
-            println!("Has neon ? {:?}", has_neon());
         }
     }
 }

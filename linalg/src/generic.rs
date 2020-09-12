@@ -1,8 +1,9 @@
-pub mod conv;
-pub mod matmul;
-pub mod vecmatmul;
+pub mod lut;
+pub mod mmm;
+pub mod sigmoid;
+pub mod tanh;
 
-pub use self::conv::SConv4x4;
-pub use self::matmul::DMatMul4x2;
-pub use self::matmul::SMatMul4x4;
-pub use self::vecmatmul::SVecMatMul8;
+pub use self::lut::GenericLut8;
+pub use self::mmm::GenericMmm4x4;
+pub use self::sigmoid::SSigmoid4;
+pub use self::tanh::STanh4;

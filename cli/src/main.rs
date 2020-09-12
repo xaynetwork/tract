@@ -1,157 +1,286 @@
-extern crate ansi_term;
-extern crate box_drawing;
-extern crate clap;
 #[macro_use]
 extern crate error_chain;
-extern crate itertools;
 #[macro_use]
 extern crate log;
-extern crate ndarray;
-extern crate atty;
-extern crate env_logger;
-extern crate libc;
-extern crate pbr;
 #[macro_use]
-extern crate tract_core;
-#[cfg(feature = "onnx")]
-extern crate tract_onnx;
-#[cfg(feature = "tf")]
-extern crate tract_tensorflow;
+extern crate serde_derive;
 
-use itertools::Itertools;
+#[macro_use]
+mod macros;
+
 use std::process;
-use std::str::FromStr;
+#[allow(unused_imports)]
+use tract_itertools::Itertools;
 
-#[cfg(feature = "tf")]
-use crate::tfpb::graph::GraphDef;
 use tract_core::internal::*;
-use tract_core::model::{InferenceModel, NormalizedModel, TypedModel};
-#[cfg(feature = "tf")]
-use tract_tensorflow::tfpb;
+use tract_hir::internal::*;
 
-use crate::display_graph::DisplayOptions;
 use crate::errors::*;
+use crate::model::Model;
 
+use readings_probe::*;
+
+mod annotations;
+mod bench;
 mod compare;
 mod cost;
-mod display_graph;
+mod display_params;
 mod draw;
 mod dump;
 mod errors;
-mod format;
+mod export;
+mod model;
 mod optimize_check;
+mod params;
 mod profile;
 mod run;
-mod rusage;
+#[cfg(feature = "pulse")]
 mod stream_check;
 mod tensor;
+mod terminal;
 mod utils;
 
-/// The default maximum for iterations and time.
-const DEFAULT_MAX_ITERS: u64 = 100_000;
-const DEFAULT_MAX_TIME: u64 = 5000;
+use params::*;
+
+readings_probe::instrumented_allocator!();
+
+fn info_usage(stage: &str, probe: Option<&Probe>) {
+    if let Some(mon) = probe {
+        let _ = mon.log_event(stage);
+    }
+    if log::log_enabled!(log::Level::Info) {
+        let usage = readings_probe::get_os_readings().unwrap();
+        info!(
+            "Resource usage {}: vsz:{} rsz:{} rszmax:{}",
+            stage, usage.virtual_size, usage.resident_size, usage.resident_size_max
+        );
+    }
+}
+
+pub const STAGES: &'static [&'static str] = &[
+    "load",
+    "analyse",
+    "incorporate",
+    "type",
+    "declutter",
+    "concretize-stream-dim",
+    "concretize-stream-dim-declutter",
+    "pulse",
+    "pulse-to-type",
+    "pulse-declutter",
+    "nnef-cycle",
+    "nnef-cycle-declutter",
+    "before-optimize",
+    "optimize",
+];
 
 /// Entrypoint for the command-line interface.
 fn main() {
     use clap::*;
     let mut app = clap_app!(("tract") =>
-        (version: "1.0")
-        (author: "Romain Liautaud <romain.liautaud@snips.ai>")
-        (author: "Mathieu Poumeyrol <mathieu.poumeyrol@snips.ai>")
-        (about: "Tract command line interface")
+    (author: "Romain Liautaud <romain.liautaud@snips.ai>")
+    (author: "Mathieu Poumeyrol <mathieu.poumeyrol@snips.ai>")
+    (version: crate_version!())
+    (about: "Tract command line interface")
 
-        (@setting UnifiedHelpMessage)
-        (@setting DeriveDisplayOrder)
+    (@setting DeriveDisplayOrder)
+    (@setting AllowLeadingHyphen)
 
-        (@arg model: +takes_value "Sets the model to use")
+    (@arg readings: --readings "Start readings instrumentation")
+    (@arg readings_heartbeat: --("readings-heartbeat") +takes_value
+     default_value("5") "Set heartbeat (ms)")
 
-        (@arg format: +takes_value
-            "Hint the model format ('onnx' or 'tf') instead of guess from extension.")
+    (@arg model: +takes_value "Sets the model to use")
 
-        (@arg input: -i --input +takes_value +multiple number_of_values(1)
-            "Set input value (@file or 3x4xi32)")
+    (@arg format: -f +takes_value
+     "Hint the model format ('kaldi', 'onnx' or 'tf') instead of guess from extension.")
 
-        (@arg stream_axis: -s --("stream-axis") +takes_value
-            "Set Axis number to stream upon (first is 0)")
+    (@arg input: -i --input +takes_value +multiple number_of_values(1)
+     "Set input shape and type (@file.pb or @file.npz:thing.npy or 3x4xi32).")
 
-        (@arg input_node: --("input-node") +takes_value +multiple number_of_values(1)
-            "Override input nodes names (auto-detects otherwise).")
+    (@arg const_input: --("const-input") +takes_value +multiple number_of_values(1)
+     "Treat input as a Const (by name), retaining its value.")
 
-        (@arg output_node: --("output-node") +takes_value
-            "Override output nodes name (auto-detects otherwise).")
+    (@arg input_bundle: --("input-bundle") +takes_value +multiple number_of_values(1)
+     "Path to an input container (.npz)")
 
-        (@arg proto: --("proto") "Keep proto model around after parse")
-        (@arg determinize: --determinize "Enforce a seed in random operator")
+    (@arg kaldi_adjust_final_offset: --("kaldi-adjust-final-offset") +takes_value
+     "Adjust value of final offset in network (for reproducibility)")
 
-        (@arg skip_analyse: --("skip-analyse") "Skip analyse after model build")
-        (@arg skip_type: --("skip-type") "Analyse as much as possible, but do not enforce full typing")
+    (@arg kaldi_downsample: --("kaldi-downsample") +takes_value
+     "Add a subsampling to output on axis 0")
 
-        (@arg declutter: --declutter "Declutter model after load")
-        (@arg optimize: -O --optimize "Optimize after model load")
-        (@arg pulse: --pulse +takes_value "Translate to pulse network")
+    (@arg kaldi_left_context: --("kaldi-left-context") +takes_value
+     "Add lines of left context to input (dupping first time frame)")
 
-        (@arg verbosity: -v ... "Sets the level of verbosity.")
+    (@arg kaldi_right_context: --("kaldi-right-context") +takes_value
+     "Add lines of right context to input (dupping last time frame)")
 
-        (@arg machine_friendly: --("machine-friendly") "Machine friendly output")
+    (@arg onnx_test_data_set: --("onnx-test-data-set") +takes_value
+     "Use onnx-test data-set as input (expect test_data_set_N dir with input_X.pb, etc. inside)")
 
-        (@arg list_ops: --("list-ops") "List all known operators")
+    (@arg input_node: --("input-node") +takes_value +multiple number_of_values(1)
+     "Override input nodes names (auto-detects otherwise).")
+
+    (@arg tf_initializer_output_node: --("tf-initializer-output-node") +takes_value +multiple number_of_values(1)
+     "Set an initializer node")
+
+    (@arg output_node: --("output-node") +takes_value +multiple number_of_values(1)
+     "Override output nodes name (auto-detects otherwise).")
+
+    (@arg override_fact: --("override-fact") +takes_value +multiple number_of_values(1)
+     "Override a fact.")
+
+    (@arg analyse_fail_fast: --("analyse-fail-fast") "Stop analyse at first error.")
+    (@arg recursive: --recursive "Apply to sub graphes")
+
+    (@arg proto: --proto "Keep proto model around after parse")
+    (@arg determinize: --determinize "Enforce a seed in random operator")
+
+    (@arg partial: --partial "Before analyse, eliminate dead branches")
+
+    (@arg pass: --pass +takes_value possible_values(STAGES) "Pass to stop preprocessing after.")
+    (@arg nnef_cycle: --("nnef-cycle") "Perform NNEF dump and reload before optimizing")
+    (@arg nnef_tract_core: --("nnef-tract-core") "Allow usage of tract-core extension in NNEF dump and load")
+    (@arg nnef_tract_onnx: --("nnef-tract-onnx") "Allow usage of tract-onnx extension in NNEF dump and load")
+    (@arg nnef_tract_pulse: --("nnef-tract-pulse") "Allow usage of tract-pulse extension in NNEF dump and load")
+
+    (@arg optimize: -O --optimize "Optimize before running")
+    (@arg pulse: --pulse +takes_value "Translate to pulse network")
+    (@arg concretize_stream_dim: --("concretize-stream-dim") +takes_value "Replace streaming dim by a concrete value")
+
+    (@arg verbosity: -v ... "Sets the level of verbosity.")
+
+    (@arg machine_friendly: --("machine-friendly") "Machine friendly output")
+
+    (@arg list_ops: --("list-ops") "List all known operators")
     );
 
     let compare = clap::SubCommand::with_name("compare")
-        .help("Compares the output of tract and tensorflow on randomly generated input.")
-        .arg(Arg::with_name("cumulative").long("cumulative").takes_value(false).help("Do not reset with reference values at each node"))
-        .arg(Arg::with_name("resilient").long("resilient").takes_value(false).help("Try nodes one per one to mitigate crashes"));
+        .long_about("Compares the output of tract and tensorflow on randomly generated input.")
+        .arg(
+            Arg::with_name("with")
+                .short("w")
+                .long("with")
+                .takes_value(true)
+                .possible_values(STAGES)
+                .help("Do not reset with reference values at each node"),
+        )
+        .arg(
+            Arg::with_name("cumulative")
+                .long("cumulative")
+                .takes_value(false)
+                .help("Do not reset with reference values at each node"),
+        )
+        .arg(
+            Arg::with_name("resilient")
+                .long("resilient")
+                .takes_value(false)
+                .help("Try nodes one per one to mitigate crashes"),
+        );
     app = app.subcommand(output_options(compare));
 
     let compare_npz = clap::SubCommand::with_name("compare-npz")
-        .help("Compares the output of tract to a refrence npz file.")
-        .arg(Arg::with_name("cumulative").long("cumulative").takes_value(false).help("Do not reset with reference values at each node"))
+        .long_about("Compares the output of tract to a refrence npz file.")
+        .arg(
+            Arg::with_name("cumulative")
+                .long("cumulative")
+                .takes_value(false)
+                .help("Do not reset with reference values at each node"),
+        )
         .arg(Arg::with_name("npz").takes_value(true).required(true).help("Npz filename"));
     app = app.subcommand(output_options(compare_npz));
 
-    let dump = clap::SubCommand::with_name("dump")
-        .help("Dumps the Tensorflow graph in human readable form.")
-        .arg(
-            Arg::with_name("assert-output")
-                .takes_value(true)
-                .long("assert-output")
-                .help("Fact to check the ouput tensor against (@filename, or 3x4xf32)"),
+    let compare_pbdir = clap::SubCommand::with_name("compare-pbdir")
+        .long_about(
+            "Compares the output of tract to a refrence directory of onnx protobufs tensors files.",
         )
         .arg(
+            Arg::with_name("cumulative")
+                .long("cumulative")
+                .takes_value(false)
+                .help("Do not reset with reference values at each node"),
+        )
+        .arg(Arg::with_name("pbdir").takes_value(true).required(true).help("protobuf dir"));
+    app = app.subcommand(output_options(compare_pbdir));
+
+    let bench = clap::SubCommand::with_name("bench")
+        .long_about("Benchmarks tract on randomly generated input.");
+    let bench = output_options(bench);
+    let bench = benchlimits_options(bench);
+    app = app.subcommand(bench);
+
+    let criterion = clap::SubCommand::with_name("criterion")
+        .long_about("Benchmarks tract on randomly generated input using criterion.");
+    app = app.subcommand(criterion);
+
+    let dump = clap::SubCommand::with_name("dump")
+        .long_about("Dumps the Tensorflow graph in human readable form.")
+        .arg(Arg::with_name("cost").long("cost").help("Include const information"))
+        .arg(Arg::with_name("profile").long("profile").help("Include results for profile run"))
+        .arg(
+            Arg::with_name("assert-cost")
+            .takes_value(true)
+            .long("assert-cost")
+            .help("Checks computed against the provided value (form: \"FMA(F32)=2060448 DIV(F32)=24576\")")
+            )
+        .arg(
+            Arg::with_name("nnef-dir")
+            .takes_value(true)
+            .long("nnef-dir")
+            .help("Dump the network in NNEF format (as a directory)"),
+            )
+        .arg(
+            Arg::with_name("nnef-tar")
+            .takes_value(true)
+            .long("nnef-tar")
+            .help("Dump the network in NNEF format (as a tar file)"),
+            )
+        .arg(
+            Arg::with_name("nnef")
+            .takes_value(true)
+            .long("nnef")
+            .help("Dump the network in NNEF format (as a tar.gz file)"),
+            )
+        .arg(
+            Arg::with_name("assert-output")
+            .takes_value(true)
+            .long("assert-output")
+            .help("Fact to check the ouput tensor against (@filename, or 3x4xf32)"),
+            )
+        .arg(
             Arg::with_name("assert-output-fact")
-                .takes_value(true)
-                .long("assert-output-fact")
-                .help("Infered shape and datum type must match exactly this"),
-        );
-    app = app.subcommand(output_options(dump));
-
-    let draw = clap::SubCommand::with_name("draw");
-    app = app.subcommand(output_options(draw));
-
-    let profile =
-        clap::SubCommand::with_name("profile")
-            .help("Benchmarks tract on randomly generated input.")
-            .arg(Arg::with_name("bench").long("bench").help("Run as an overall bench"))
-            .arg(
-                Arg::with_name("max_iters").takes_value(true).long("max-iters").short("n").help(
-                    "Sets the maximum number of iterations for each node [default: 100_000].",
-                ),
+            .takes_value(true)
+            .long("assert-output-fact")
+            .help("Infered shape and datum type must match exactly this"),
             )
-            .arg(
-                Arg::with_name("max-time")
-                    .takes_value(true)
-                    .long("max-time")
-                    .help("Sets the maximum execution time for each node (in ms) [default: 5000]."),
-            )
-            .arg(
-                Arg::with_name("buffering")
-                    .short("b")
-                    .help("Run the stream network without inner instrumentations"),
+        .arg(
+            Arg::with_name("inner")
+            .takes_value(true)
+            .number_of_values(1)
+            .multiple(true)
+            .long("inner")
+            .help("Navigate to a sub-model"),
             );
-    app = app.subcommand(output_options(profile));
+    let dump = output_options(dump);
+    let dump = benchlimits_options(dump);
+    app = app.subcommand(dump);
 
     let run = clap::SubCommand::with_name("run")
-        .help("Run the graph")
+        .long_about("Run the graph")
+        .arg(Arg::with_name("dump").long("dump").help("Show output"))
+        .arg(Arg::with_name("steps").long("steps").help("Show all inputs and outputs"))
+        .arg(
+            Arg::with_name("assert-sane-floats")
+                .long("assert-sane-floats")
+                .help("Check float for NaN and infinites at each step"),
+        )
+        .arg(
+            Arg::with_name("assert-output-bundle")
+                .takes_value(true)
+                .long("assert-output-bundle")
+                .help("Checks values against these tensor (.npz)"),
+        )
         .arg(
             Arg::with_name("assert-output")
                 .takes_value(true)
@@ -166,21 +295,29 @@ fn main() {
         );
     app = app.subcommand(output_options(run));
 
-    let cost = clap::SubCommand::with_name("cost").help("Compute a cost on (some) operations.");
-    app = app.subcommand(output_options(cost));
-
     let optimize = clap::SubCommand::with_name("optimize").help("Optimize the graph");
     app = app.subcommand(output_options(optimize));
 
     let optimize_check = clap::SubCommand::with_name("optimize-check")
-        .help("Compare output of optimized and un-optimized graph");
+        .long_about("Compare output of optimized and un-optimized graph");
     app = app.subcommand(output_options(optimize_check));
 
     let stream_check = clap::SubCommand::with_name("stream-check")
-        .help("Compare output of streamed and regular exec");
+        .long_about("Compare output of streamed and regular exec");
     app = app.subcommand(output_options(stream_check));
 
     let matches = app.get_matches();
+
+    let probe = if matches.is_present("readings") {
+        let file = std::fs::File::create("readings.out").unwrap();
+        let mut probe = Probe::new(file).unwrap();
+        probe.register_i64("progress").unwrap();
+        let heartbeat = matches.value_of("readings_heartbeat").unwrap().parse::<f32>().unwrap();
+        probe.spawn_heartbeat(std::time::Duration::from_secs_f32(heartbeat / 1000.0)).unwrap();
+        Some(probe)
+    } else {
+        None
+    };
 
     if ::std::env::var("RUST_LOG").is_err() {
         let level = match matches.occurrences_of("verbosity") {
@@ -194,18 +331,44 @@ fn main() {
 
     let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "warn");
 
-    env_logger::Builder::from_env(env).default_format_timestamp_nanos(true).init();
+    env_logger::Builder::from_env(env).format_timestamp_nanos().init();
+    info_usage("init", probe.as_ref());
 
-    if let Err(e) = handle(matches) {
-        error!("{}", e.to_string());
+    if let Err(e) = handle(matches, probe.as_ref()) {
+        use error_chain::ChainedError;
+        error!("{}", e.display_chain());
         process::exit(1)
     }
+
+    info_usage("done", probe.as_ref());
+}
+
+fn benchlimits_options<'a, 'b>(command: clap::App<'a, 'b>) -> clap::App<'a, 'b> {
+    use clap::*;
+    command
+        .arg(
+            Arg::with_name("max_iters")
+                .takes_value(true)
+                .long("max-iters")
+                .short("n")
+                .help("Sets the maximum number of iterations for each node [default: 100_000]."),
+        )
+        .arg(
+            Arg::with_name("max-time")
+                .takes_value(true)
+                .long("max-time")
+                .help("Sets the maximum execution time for each node (in ms) [default: 5000]."),
+        )
 }
 
 fn output_options<'a, 'b>(command: clap::App<'a, 'b>) -> clap::App<'a, 'b> {
     use clap::*;
     command
-        .arg(Arg::with_name("natural-order").long("natural-order").help("dump nodes in id order instead of evaluation order"))
+        .arg(
+            Arg::with_name("natural-order")
+                .long("natural-order")
+                .help("dump nodes in id order instead of evaluation order"),
+        )
         .arg(Arg::with_name("quiet").short("q").long("quiet").help("don't dump"))
         .arg(Arg::with_name("debug-op").long("debug-op").help("show debug dump for each op"))
         .arg(
@@ -233,257 +396,21 @@ fn output_options<'a, 'b>(command: clap::App<'a, 'b>) -> clap::App<'a, 'b> {
                 .help("Select one node to dump"),
         )
         .arg(Arg::with_name("const").long("const").help("also display consts nodes"))
-}
-
-#[derive(Debug)]
-pub enum SomeGraphDef {
-    NoGraphDef,
-    #[cfg(feature = "tf")]
-    Tf(GraphDef),
-    #[cfg(feature = "onnx")]
-    Onnx(tract_onnx::pb::ModelProto),
-}
-
-#[derive(Debug)]
-pub enum SomeModel {
-    Inference(InferenceModel),
-    Typed(TypedModel),
-    Normalized(NormalizedModel),
-    Pulsed(NormalizedModel, PulsedModel),
-}
-
-/// Structure holding the parsed parameters.
-pub struct Parameters {
-    graph: SomeGraphDef,
-    unoptimized_model: Option<TypedModel>,
-    tract_model: SomeModel,
-
-    #[cfg(feature = "conform")]
-    tf_model: Option<tract_tensorflow::conform::tf::Tensorflow>,
-
-    #[cfg(not(feature = "conform"))]
-    #[allow(dead_code)]
-    tf_model: (),
-
-    inputs: Option<Vec<Option<Arc<Tensor>>>>,
-
-    assertions: Option<Assertions>,
-
-    machine_friendly: bool,
-}
-
-impl Parameters {
-    /// Parses the command-line arguments.
-    pub fn from_clap(matches: &clap::ArgMatches) -> CliResult<Parameters> {
-        let name = matches.value_of("model").unwrap();
-        let format = matches.value_of("format").unwrap_or(if name.ends_with(".onnx") {
-            "onnx"
-        } else {
-            "tf"
-        });
-        let (mut graph, mut raw_model) = if format == "onnx" {
-            #[cfg(not(feature = "onnx"))]
-            {
-                panic!("Tract compiled without onnx feature");
-            }
-            #[cfg(feature = "onnx")]
-            {
-                let onnx = tract_onnx::onnx();
-                let graph = onnx.proto_model_for_path(&name)?;
-                let tract = onnx.model_for_proto_model(&graph)?;
-                (SomeGraphDef::Onnx(graph), tract)
-            }
-        } else {
-            #[cfg(not(feature = "tf"))]
-            {
-                panic!("Tract compiled without tensorflow feature");
-            }
-            #[cfg(feature = "tf")]
-            {
-                let tf = tract_tensorflow::tensorflow();
-                let mut graph = tf.proto_model_for_path(&name)?;
-                if matches.is_present("determinize") {
-                    tract_tensorflow::Tensorflow::determinize(&mut graph)?;
-                }
-                let tract = tf.model_for_proto_model(&graph)?;
-                (SomeGraphDef::Tf(graph), tract)
-            }
-        };
-
-        info!("Model {:?} loaded", name);
-
-        #[cfg(feature = "conform")]
-        let tf_model = if format == "tf" {
-            info!("Tensorflow version: {}", tract_tensorflow::conform::tf::version());
-            if matches.is_present("determinize") {
-                if let SomeGraphDef::Tf(ref graph) = graph {
-                    use tract_tensorflow::conform::Message;
-                    let graph = graph.write_to_bytes().unwrap();
-                    Some(tract_tensorflow::conform::tf::for_slice(&graph)?)
-                } else {
-                    unreachable!()
-                }
-            } else {
-                Some(tract_tensorflow::conform::tf::for_path(&name)?)
-            }
-        } else {
-            None
-        };
-
-        if !matches.is_present("proto") {
-            graph = SomeGraphDef::NoGraphDef;
-        }
-
-        #[cfg(not(feature = "conform"))]
-        let tf_model = ();
-
-        if let Some(inputs) = matches.values_of("input_node") {
-            raw_model.set_input_names(inputs)?;
-        };
-
-        if let Some(outputs) = matches.values_of("output_node") {
-            raw_model.set_output_names(outputs)?;
-        };
-
-        let machine_friendly = matches.is_present("machine_friendly");
-
-        let inputs = if let Some(inputs) = matches.values_of("input") {
-            let mut vs = vec![];
-            for (ix, v) in inputs.enumerate() {
-                let t = tensor::for_string(v)?;
-                let outlet = raw_model.input_outlets()?[ix];
-                vs.push(t.value.concretize());
-                raw_model.set_outlet_fact(outlet, t)?;
-            }
-            Some(vs)
-        } else {
-            None
-        };
-
-        let pulse: Option<usize> = matches.value_of("pulse").map(|s| s.parse()).transpose()?;
-
-        //        println!("{:?}", raw_model);
-
-        let mut unoptimized_model = None;
-        let mut tract_model = if !matches.is_present("skip_analyse") {
-            info!("Running analyse");
-            if let Err(e) = raw_model.analyse(true) {
-                // do not stop on mere analyse error
-                error!("Analyse failed: {}", e);
-            }
-            if matches.is_present("skip_type") {
-                SomeModel::Inference(raw_model)
-            } else {
-                let typed = raw_model.into_typed()?;
-                unoptimized_model = Some(typed.clone());
-                SomeModel::Typed(typed)
-            }
-        } else {
-            info!("Skipping analyse");
-            SomeModel::Inference(raw_model)
-        };
-
-        if matches.is_present("optimize")
-            || matches.is_present("declutter")
-            || pulse.is_some()
-            || matches.subcommand().0 == "optimize-check"
-        {
-            if let SomeModel::Typed(typed) = tract_model {
-                info!("Declutter");
-                tract_model = SomeModel::Typed(typed.declutter()?);
-            } else {
-                bail!("Can not run optimize without analyse")
-            }
-        }
-
-        if let (Some(pulse), &SomeModel::Typed(ref model)) = (pulse, &tract_model) {
-            info!("Convert to normalized net");
-            let normalized = model.clone().into_normalized()?;
-            info!("Pulsify {}", pulse);
-            let pulsed = ::tract_core::pulse::PulsedModel::new(&normalized, pulse)?;
-            tract_model = SomeModel::Pulsed(normalized, pulsed);
-        };
-
-        if matches.is_present("optimize") {
-            if let SomeModel::Typed(typed) = tract_model {
-                tract_model = SomeModel::Typed(typed.codegen()?);
-            } else if let SomeModel::Pulsed(_, pulsed) = tract_model {
-                tract_model = SomeModel::Typed(pulsed.into_typed()?.codegen()?);
-            }
-        }
-
-        info!("Model ready");
-
-        Ok(Parameters {
-            graph,
-            unoptimized_model,
-            tract_model,
-            tf_model,
-            inputs,
-            assertions: None,
-            machine_friendly,
-        })
-    }
-}
-
-pub enum ProfilingMode {
-    Regular { max_iters: u64, max_time: u64 },
-    RegularBenching { max_iters: u64, max_time: u64 },
-}
-
-impl ProfilingMode {
-    pub fn from_clap(matches: &clap::ArgMatches) -> CliResult<ProfilingMode> {
-        let max_iters = matches
-            .value_of("max_iters")
-            .map(u64::from_str)
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_ITERS);
-        let max_time = matches
-            .value_of("max-time")
-            .map(u64::from_str)
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_TIME);
-        let mode = if matches.is_present("bench") {
-            ProfilingMode::RegularBenching { max_iters, max_time }
-        } else {
-            ProfilingMode::Regular { max_iters, max_time }
-        };
-        Ok(mode)
-    }
-}
-
-pub fn display_options_from_clap(matches: &clap::ArgMatches) -> CliResult<DisplayOptions> {
-    Ok(DisplayOptions {
-        konst: matches.is_present("const"),
-        quiet: matches.is_present("quiet"),
-        natural_order: matches.is_present("natural-order"),
-        debug_op: matches.is_present("debug-op"),
-        node_ids: matches.values_of("node_id").map(|id| id.map(|id| id.parse().unwrap()).collect()),
-        node_name: matches.value_of("node_name").map(String::from),
-        op_name: matches.value_of("op_name").map(String::from),
-        successors: matches.value_of("successors").map(|id| id.parse().unwrap()),
-    })
-}
-
-pub struct Assertions {
-    assert_outputs: Option<Vec<TensorFact>>,
-    assert_output_facts: Option<Vec<TensorFact>>,
-}
-
-impl Assertions {
-    fn from_clap(sub_matches: &clap::ArgMatches) -> CliResult<Assertions> {
-        let assert_outputs: Option<Vec<TensorFact>> = sub_matches
-            .values_of("assert-output")
-            .map(|vs| vs.map(|v| tensor::for_string(v).unwrap()).collect());
-        let assert_output_facts: Option<Vec<TensorFact>> = sub_matches
-            .values_of("assert-output-fact")
-            .map(|vs| vs.map(|v| tensor::for_string(v).unwrap()).collect());
-        Ok(Assertions { assert_outputs, assert_output_facts })
-    }
+        .arg(Arg::with_name("info").long("info").help("show op inner information"))
+        .arg(Arg::with_name("io-long").long("io-long").help("show full i/o information"))
+        .arg(Arg::with_name("io-none").long("io-none").help("hide i/o information"))
+        .arg(Arg::with_name("json").long("json").help("dump performance info as json"))
+        .arg(Arg::with_name("outlet-labels").long("outlet-labels").help("display outlet labels"))
+        .arg(
+            Arg::with_name("invariants")
+                .takes_value(false)
+                .long("invariants")
+                .help("Display operators invariants"),
+        )
 }
 
 /// Handles the command-line input.
-fn handle(matches: clap::ArgMatches) -> CliResult<()> {
+fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> CliResult<()> {
     if matches.is_present("list_ops") {
         #[cfg(feature = "onnx")]
         {
@@ -504,55 +431,149 @@ fn handle(matches: clap::ArgMatches) -> CliResult<()> {
         return Ok(());
     }
 
-    let mut params = Parameters::from_clap(&matches)?;
+    let builder_result = Parameters::from_clap(&matches, probe);
+    let params = match builder_result {
+        Ok(params) => params,
+        Err(e) => {
+            if let CliError(CliErrorKind::ModelBuilding(ref broken_model), _) = e {
+                let mut broken_model: Box<dyn Model> =
+                    tract_hir::tract_core::dyn_clone::clone(broken_model);
+                let annotations =
+                    crate::annotations::Annotations::from_model(broken_model.as_ref())?;
+                let display_params = if let ("dump", Some(sm)) = matches.subcommand() {
+                    display_params_from_clap(&matches, &sm)?
+                } else {
+                    crate::display_params::DisplayParams::default()
+                };
+
+                if broken_model.output_outlets().len() == 0 {
+                    broken_model.auto_outputs()?;
+                }
+                terminal::render(broken_model.as_ref(), &annotations, &display_params)?;
+            }
+            Err(e)?
+        }
+    };
+
+    let mut need_optimisations = false;
 
     match matches.subcommand() {
+        ("bench", Some(m)) => {
+            need_optimisations = true;
+            bench::handle(&params, &BenchLimits::from_clap(&m)?, probe)
+        }
+
+        ("criterion", _) => {
+            need_optimisations = true;
+            bench::criterion(&params)
+        }
+
         #[cfg(feature = "conform")]
         ("compare", Some(m)) => compare::handle_tensorflow(
             m.is_present("cumulative"),
             m.is_present("resilient"),
-            params,
-            display_options_from_clap(m)?,
+            &mut params,
+            display_params_from_clap(&matches, m)?,
         ),
-        #[cfg(not(feature = "conform"))]
-        ("compare", _) => bail!("Need conform feature to be able to run comparison"),
+
+        ("compare", Some(m)) => compare::handle_reference_stage(
+            m.is_present("cumulative"),
+            &params,
+            &display_params_from_clap(&matches, m)?,
+        ),
 
         ("compare-npz", Some(m)) => compare::handle_npz(
             m.is_present("cumulative"),
             m.value_of("npz").unwrap(),
-            params,
-            display_options_from_clap(m)?,
+            &params,
+            &display_params_from_clap(&matches, m)?,
         ),
 
-        ("run", Some(m)) => {
-            params.assertions = Some(Assertions::from_clap(m)?);
-            run::handle(params)
-        }
+        #[cfg(feature = "onnx")]
+        ("compare-pbdir", Some(m)) => compare::handle_pbdir(
+            m.is_present("cumulative"),
+            m.value_of("pbdir").unwrap(),
+            &params,
+            &display_params_from_clap(&matches, m)?,
+        ),
+
+        ("run", Some(m)) => run::handle(&params, m),
 
         ("optimize-check", Some(m)) => {
-            optimize_check::handle(params, display_options_from_clap(m)?)
+            optimize_check::handle(&params, display_params_from_clap(&matches, m)?)
         }
 
-        ("stream-check", Some(m)) => stream_check::handle(params, display_options_from_clap(m)?),
-
-        ("cost", Some(m)) => crate::cost::handle(params, display_options_from_clap(m)?),
-
-        ("draw", Some(m)) => {
-            crate::draw::render(&params.tract_model, display_options_from_clap(m)?)
+        #[cfg(feature="pulse")]
+        ("stream-check", Some(m)) => {
+            stream_check::handle(&params, &display_params_from_clap(&matches, m)?)
         }
+
+        ("", None) => dump::handle(
+            &params,
+            &display_params_from_clap(&matches, &clap::ArgMatches::default())?,
+            &matches,
+            &clap::ArgMatches::default(),
+            &BenchLimits::from_clap(&clap::ArgMatches::default())?,
+            vec![],
+        ),
 
         ("dump", Some(m)) => {
-            params.assertions = Some(Assertions::from_clap(m)?);
-            dump::handle(params, display_options_from_clap(m)?)
-        }
-
-        ("profile", Some(m)) => {
-            if !matches.is_present("optimize") {
-                warn!("Profiling un-optimized network. Consider adding -O.");
-            }
-            profile::handle(params, ProfilingMode::from_clap(&m)?, display_options_from_clap(m)?)
+            need_optimisations = m.is_present("profile");
+            let inner = m
+                .values_of("inner")
+                .map(|ss| ss.map(|s| s.to_string()).collect())
+                .unwrap_or(vec![]);
+            dump::handle(
+                &params,
+                &display_params_from_clap(&matches, m)?,
+                &matches,
+                m,
+                &BenchLimits::from_clap(&m)?,
+                inner,
+            )
         }
 
         (s, _) => bail!("Unknown subcommand {}.", s),
+    }?;
+
+    if need_optimisations {
+        let style = ansi_term::Style::new().fg(ansi_term::Color::Red).bold();
+        if !matches.is_present("optimize") {
+            warn!("{}", style.paint("Profiling an un-optimized network. Consider adding -O."));
+        }
+        if cfg!(debug_assertions) {
+            warn!("{}", style.paint("Profiling a debug build of tract!"));
+        }
     }
+    Ok(())
+}
+
+fn nnef(matches: &clap::ArgMatches) -> tract_nnef::internal::Nnef {
+    let mut fw = tract_nnef::nnef();
+    if matches.is_present("nnef_tract_onnx") {
+        #[cfg(feature = "onnx")]
+        {
+            use tract_onnx::WithOnnx;
+            fw = fw.with_onnx();
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            panic!("tract is build without ONNX support")
+        }
+    }
+    if matches.is_present("nnef_tract_pulse") {
+        #[cfg(feature = "pulse")]
+        {
+            use tract_pulse::WithPulse;
+            fw = fw.with_pulse();
+        }
+        #[cfg(not(feature = "pulse"))]
+        {
+            panic!("tract is build without ONNX support")
+        }
+    }
+    if matches.is_present("nnef_tract_core") {
+        fw = fw.with_tract_core();
+    }
+    fw
 }
