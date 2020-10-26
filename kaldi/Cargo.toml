@@ -1,6 +1,6 @@
 [package]
 name = "tract-kaldi"
-version = "0.11.1-pre"
+version = "0.11.2-pre"
 authors = [
     "Mathieu Poumeyrol <kali@zoy.org>",
     "Theodore Bluche <theodore.bluche@snips.ai>"

@@ -1,6 +1,5 @@
 use crate::internal::*;
 use crate::ops::element_wise::ElementWiseOp;
-use ndarray::ArrayViewD;
 use num_traits::AsPrimitive;
 use num_traits::Zero;
 use tract_linalg::lut::Lut;
@@ -147,110 +146,6 @@ fn info_quantize_linear_i8(q: &QuantizeLinearI8) -> TractResult<Vec<String>> {
     )])
 }
 
-fn dynamic_quantize_linear_f32_u8(x: f32, scale: f32, zero_point: u8) -> u8 {
-    (((x / scale).round() as i32) + zero_point as i32)
-        .max(u8::min_value() as i32)
-        .min(u8::max_value() as i32) as u8
-}
-
-fn dynamic_quantize_linear_u8(scale: f32, zero_point: u8, xs: &[f32], ys: &mut [u8]) {
-    xs.iter()
-        .zip(ys.iter_mut())
-        .for_each(|(x, y)| *y = dynamic_quantize_linear_f32_u8(*x, scale, zero_point));
-}
-
-fn scale_and_zero_point<'a>(v: ArrayViewD<'a, f32>) -> (f32, u8) {
-    // get the min and max of v and extend it to have zero included
-    // in the interval [min, max]
-    let (min, max) = v.fold((0., 0.), |(a_min, a_max), &v| {
-        if v < a_min {
-            (v, a_max)
-        } else if v > a_max {
-            (a_min, v)
-        } else {
-            (a_min, a_max)
-        }
-    });
-
-    // quantize range
-    let min_t = u8::min_value() as f32;
-    let max_t = u8::max_value() as f32;
-
-    let scale = (max - min) / max_t;
-
-    let zero_point = -min / scale;
-    let zero_point = zero_point.round();
-    // clipping to [0, 255]
-    let zero_point = zero_point.max(min_t);
-    let zero_point = zero_point.min(max_t);
-
-    let zero_point: u8 = zero_point as u8;
-
-    (scale, zero_point)
-}
-
-#[derive(Clone, Debug, new, Hash)]
-pub struct DynamicQuantizeLinearU8;
-
-impl Op for DynamicQuantizeLinearU8 {
-    fn name(&self) -> Cow<str> {
-        "DynamicQuantizeLinearU8".into()
-    }
-
-    fn info(&self) -> TractResult<Vec<String>> {
-        Ok(vec![])
-    }
-
-    fn validation(&self) -> Validation {
-        Validation::Accurate
-    }
-
-    op_core_mir!();
-    op_as_typed_op!();
-}
-
-tract_linalg::impl_dyn_hash!(DynamicQuantizeLinearU8);
-
-impl EvalOp for DynamicQuantizeLinearU8 {
-    fn is_stateless(&self) -> bool {
-        true
-    }
-    fn eval(&self, inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
-        let input = &inputs[0];
-        let a_input = input.to_array_view::<f32>()?;
-        let (scale, zero_point) = scale_and_zero_point(a_input);
-
-        let mut dst = unsafe { Tensor::uninitialized_dt(u8::datum_type(), input.shape())? };
-        // We cannot use quantize_linear_u8 here because it does `x * scale.recip()`
-        // instead of `x / scale`. This change some number enough to be rounded to another integer.
-        dynamic_quantize_linear_u8(
-            scale,
-            zero_point,
-            input.as_slice::<f32>()?,
-            dst.as_slice_mut::<u8>()?,
-        );
-
-        let quantized_tensor = dst.into_arc_tensor();
-        let scale_tensor = rctensor0(scale);
-        let zero_point_tensor = rctensor0(zero_point);
-
-        Ok(tvec!(quantized_tensor, scale_tensor, zero_point_tensor))
-    }
-}
-
-impl TypedOp for DynamicQuantizeLinearU8 {
-    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        let mut quantized_fact = inputs[0].clone();
-        quantized_fact.datum_type = u8::datum_type();
-        let shape = ShapeFact::from_dims(&[])?;
-        let scale_fact = TypedFact::dt_shape(f32::datum_type(), shape.clone())?;
-        let zero_fact = TypedFact::dt_shape(u8::datum_type(), shape)?;
-        Ok(tvec!(quantized_fact, scale_fact, zero_fact))
-    }
-
-    as_op!();
-}
-
 #[derive(Clone, Debug, new, Educe)]
 #[educe(Hash)]
 pub struct DequantizeLinearF32 {
@@ -288,7 +183,7 @@ impl Op for DequantizeLinearF32 {
     op_as_typed_op!();
 }
 
-tract_linalg::impl_dyn_hash!(DequantizeLinearF32);
+tract_data::impl_dyn_hash!(DequantizeLinearF32);
 
 impl EvalOp for DequantizeLinearF32 {
     fn is_stateless(&self) -> bool {

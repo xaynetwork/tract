@@ -2,7 +2,6 @@ use crate::infer::*;
 use crate::internal::*;
 
 use std::borrow::Borrow;
-use tract_core::dim::DimLike;
 use tract_core::ops::cnn::conv::ConvUnary;
 use tract_core::ops::cnn::conv::KernelFormat;
 use tract_core::ops::cnn::{PaddingSpec, PoolSpec};
@@ -33,7 +32,7 @@ pub struct Conv {
     pub override_output_datum_type: Option<DatumType>,
 }
 
-tract_linalg::impl_dyn_hash!(Conv);
+tract_data::impl_dyn_hash!(Conv);
 
 impl Conv {
     pub fn hwc(self) -> Conv {

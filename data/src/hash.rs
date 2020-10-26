@@ -48,7 +48,7 @@ macro_rules! impl_dyn_hash {
     ($t: ty) => {
         impl DynHash for $t {
             fn dyn_hash(&self, state: &mut dyn std::hash::Hasher) {
-                $crate::hash::dyn_hash(self, state)
+                dyn_hash(self, state)
             }
         }
     };

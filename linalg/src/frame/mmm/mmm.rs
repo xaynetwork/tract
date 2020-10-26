@@ -2,6 +2,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::{Add, Mul};
+use tract_data::internal::*;
 
 use num_traits::Zero;
 
@@ -11,15 +12,15 @@ use super::fuse::ScratchSpaceFusedNonLinear;
 use super::*;
 
 pub trait MatMatMul<TA, TB, TC, TI>:
-    Debug + fmt::Display + dyn_clone::DynClone + Send + Sync + crate::hash::DynHash + std::any::Any
+    Debug + fmt::Display + dyn_clone::DynClone + Send + Sync + DynHash + std::any::Any
 where
     TA: Copy + Zero + 'static,
     TB: Copy + Zero + 'static,
     TC: Copy + Debug + 'static,
     TI: Copy + Add + Mul + Zero + Debug + 'static,
 {
-    fn a_pack(&self) -> PackA<TA>;
-    fn b_pack(&self) -> PackB<TB>;
+    fn a_pack(&self) -> PackA;
+    fn b_pack(&self) -> PackB;
 
     fn a_storage(&self) -> &MatrixStoreSpec;
     fn b_storage(&self) -> &MatrixStoreSpec;
@@ -136,11 +137,11 @@ where
     TI: Copy + Add + Mul + Zero + Debug + 'static,
     K: MatMatMulKer<TA, TB, TC, TI> + 'static,
 {
-    fn a_pack(&self) -> PackA<TA> {
+    fn a_pack(&self) -> PackA {
         PackA::new(self.k, self.m, K::mr(), K::alignment_bytes_packed_a())
     }
 
-    fn b_pack(&self) -> PackB<TB> {
+    fn b_pack(&self) -> PackB {
         PackB::new(self.k, self.n, K::nr(), K::alignment_bytes_packed_b())
     }
 
@@ -306,7 +307,7 @@ where
     }
 }
 
-impl<K, TA, TB, TC, TI> crate::hash::DynHash for MatMatMulImpl<K, TA, TB, TC, TI>
+impl<K, TA, TB, TC, TI> DynHash for MatMatMulImpl<K, TA, TB, TC, TI>
 where
     TA: Copy + Zero + 'static,
     TB: Copy + Zero + 'static,
@@ -315,7 +316,7 @@ where
     K: MatMatMulKer<TA, TB, TC, TI>,
 {
     fn dyn_hash(&self, hasher: &mut dyn std::hash::Hasher) {
-        crate::hash::dyn_hash(self, hasher)
+        dyn_hash(self, hasher)
     }
 }
 
@@ -348,7 +349,6 @@ where
 #[macro_use]
 pub mod test {
     use super::*;
-    use crate::align::Buffer;
     use crate::test::*;
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
@@ -541,7 +541,7 @@ pub mod test {
         };
     }
 
-    pub fn strat_mat_mat_mul<TA: Datum, TB: Datum>(
+    pub fn strat_mat_mat_mul<TA: LADatum, TB: LADatum>(
     ) -> BoxedStrategy<(usize, usize, usize, Vec<TA>, Vec<TB>)> {
         (1usize..5, 1usize..5, 1usize..5)
             .prop_flat_map(move |(m, k, n)| {
@@ -556,7 +556,7 @@ pub mod test {
             .boxed()
     }
 
-    pub fn strat_mat_vec_mul<TA: Datum, TB: Datum>(
+    pub fn strat_mat_vec_mul<TA: LADatum, TB: LADatum>(
     ) -> BoxedStrategy<(usize, usize, Vec<TA>, Vec<TB>)> {
         (1usize..15, 1usize..15)
             .prop_flat_map(move |(m, k)| {
@@ -578,22 +578,31 @@ pub mod test {
         b: &[TB],
     ) -> Result<(), proptest::test_runner::TestCaseError>
     where
-        TA: Datum + AsPrimitive<TI> + 'static,
-        TB: Datum + AsPrimitive<TI> + 'static,
-        TC: Datum + 'static,
-        TI: Datum + AsPrimitive<TC> + 'static,
+        TA: LADatum + AsPrimitive<TI> + 'static,
+        TB: LADatum + AsPrimitive<TI> + 'static,
+        TC: LADatum + 'static,
+        TI: LADatum + AsPrimitive<TC> + 'static,
     {
         let op = MatMatMulImpl::<K, TA, TB, TC, TI>::new(m, k, n);
         unsafe {
-            let mut packed_a = Buffer::uninitialized(op.a_pack().len(), op.a_pack().alignment());
-            op.a_pack().pack(packed_a.as_mut_ptr(), a.as_ptr(), k as isize, 1);
+            let mut packed_a =
+                Tensor::uninitialized_aligned::<TA>(&[op.a_pack().len()], op.a_pack().alignment())
+                    .unwrap();
+            op.a_pack().pack(packed_a.as_ptr_mut_unchecked(), a.as_ptr(), k as isize, 1);
 
-            let mut packed_b = Buffer::uninitialized(op.b_pack().len(), op.b_pack().alignment());
-            op.b_pack().pack(packed_b.as_mut_ptr(), b.as_ptr(), n as isize, 1);
+            let mut packed_b =
+                Tensor::uninitialized_aligned::<TB>(&[op.b_pack().len()], op.b_pack().alignment())
+                    .unwrap();
+            op.b_pack().pack(packed_b.as_ptr_mut_unchecked(), b.as_ptr(), n as isize, 1);
 
             let mut found = vec![TC::max_value(); m * n];
 
-            op.run(packed_a.as_ptr(), packed_b.as_ptr(), found.as_mut_ptr(), &[]);
+            op.run(
+                packed_a.as_ptr_unchecked(),
+                packed_b.as_ptr_unchecked(),
+                found.as_mut_ptr(),
+                &[],
+            );
 
             let mut expected = vec![TC::zero(); m * n];
             for x in 0..n {
@@ -618,21 +627,23 @@ pub mod test {
         b: &[TB],
     ) -> Result<(), proptest::test_runner::TestCaseError>
     where
-        TA: Datum + AsPrimitive<TI> + 'static,
-        TB: Datum + AsPrimitive<TI> + 'static,
-        TC: Datum + 'static,
-        TI: Datum + AsPrimitive<TC> + 'static,
+        TA: LADatum + AsPrimitive<TI> + 'static,
+        TB: LADatum + AsPrimitive<TI> + 'static,
+        TC: LADatum + 'static,
+        TI: LADatum + AsPrimitive<TC> + 'static,
     {
         unsafe {
             let mut op = MatMatMulImpl::<K, TA, TB, TC, TI>::new(m, k, 1);
             op.b_vec_from_data_and_stride(1);
             op.c_vec_from_data_and_stride(1);
-            let mut packed_a = Buffer::uninitialized(op.a_pack().len(), op.a_pack().alignment());
-            op.a_pack().pack(packed_a.as_mut_ptr(), a.as_ptr(), k as isize, 1);
+            let mut packed_a =
+                Tensor::uninitialized_aligned::<TA>(&[op.a_pack().len()], op.a_pack().alignment())
+                    .unwrap();
+            op.a_pack().pack(packed_a.as_ptr_mut_unchecked(), a.as_ptr(), k as isize, 1);
 
             let mut found = vec![TC::zero(); m];
 
-            op.run(packed_a.as_ptr(), b.as_ptr(), found.as_mut_ptr(), &[]);
+            op.run(packed_a.as_ptr_unchecked(), b.as_ptr(), found.as_mut_ptr(), &[]);
 
             let mut expected = vec![TC::zero(); m];
             for y in 0..m {
@@ -664,24 +675,28 @@ pub mod test {
         expect: F,
     ) -> proptest::test_runner::TestCaseResult
     where
-        TA: Datum + AsPrimitive<TI>,
-        TB: Datum + AsPrimitive<TI>,
-        TC: Datum,
-        TI: Datum + AsPrimitive<TC>,
+        TA: LADatum + AsPrimitive<TI>,
+        TB: LADatum + AsPrimitive<TI>,
+        TC: LADatum,
+        TI: LADatum + AsPrimitive<TC>,
     {
         let a = vec![TA::one(); m * k];
         let b = vec![TB::one(); n * k];
         let op = MatMatMulImpl::<K, TA, TB, TC, TI>::new(m, k, n);
 
-        let mut packed_a = Buffer::uninitialized(op.a_pack().len(), op.a_pack().alignment());
-        op.a_pack().pack(packed_a.as_mut_ptr(), a.as_ptr(), k as isize, 1);
+        let mut packed_a =
+            Tensor::uninitialized_aligned::<TA>(&[op.a_pack().len()], op.a_pack().alignment())
+                .unwrap();
+        op.a_pack().pack(packed_a.as_ptr_mut_unchecked(), a.as_ptr(), k as isize, 1);
 
-        let mut packed_b = Buffer::uninitialized(op.b_pack().len(), op.b_pack().alignment());
-        op.b_pack().pack(packed_b.as_mut_ptr(), b.as_ptr(), n as isize, 1);
+        let mut packed_b =
+            Tensor::uninitialized_aligned::<TB>(&[op.b_pack().len()], op.b_pack().alignment())
+                .unwrap();
+        op.b_pack().pack(packed_b.as_ptr_mut_unchecked(), b.as_ptr(), n as isize, 1);
 
         let mut found = vec![TC::zero(); m * n];
 
-        op.run(packed_a.as_ptr(), packed_b.as_ptr(), found.as_mut_ptr(), spec);
+        op.run(packed_a.as_ptr_unchecked(), packed_b.as_ptr_unchecked(), found.as_mut_ptr(), spec);
 
         let mut inter = vec![TI::zero(); m * n];
         for x in 0..n {
@@ -705,10 +720,10 @@ pub mod test {
         n: usize,
     ) -> proptest::test_runner::TestCaseResult
     where
-        TA: Datum + AsPrimitive<TI>,
-        TB: Datum + AsPrimitive<TI>,
-        TC: Datum,
-        TI: Datum + AsPrimitive<TC>,
+        TA: LADatum + AsPrimitive<TI>,
+        TB: LADatum + AsPrimitive<TI>,
+        TC: LADatum,
+        TI: LADatum + AsPrimitive<TC>,
         usize: AsPrimitive<TI>,
     {
         let bias = (0..m).map(|i| i.as_()).collect::<Vec<TI>>();
@@ -727,10 +742,10 @@ pub mod test {
         n: usize,
     ) -> proptest::test_runner::TestCaseResult
     where
-        TA: Datum + AsPrimitive<TI>,
-        TB: Datum + AsPrimitive<TI>,
-        TC: Datum,
-        TI: Datum + AsPrimitive<TC>,
+        TA: LADatum + AsPrimitive<TI>,
+        TB: LADatum + AsPrimitive<TI>,
+        TC: LADatum,
+        TI: LADatum + AsPrimitive<TC>,
         usize: AsPrimitive<TI>,
     {
         let bias = (0..m).map(|i| i.as_()).collect::<Vec<TI>>();
@@ -749,10 +764,10 @@ pub mod test {
         n: usize,
     ) -> proptest::test_runner::TestCaseResult
     where
-        TA: Datum + AsPrimitive<TI>,
-        TB: Datum + AsPrimitive<TI>,
-        TC: Datum,
-        TI: Datum + AsPrimitive<TC>,
+        TA: LADatum + AsPrimitive<TI>,
+        TB: LADatum + AsPrimitive<TI>,
+        TC: LADatum,
+        TI: LADatum + AsPrimitive<TC>,
         usize: AsPrimitive<TI>,
     {
         let bias = (0..n).map(|i| i.as_()).collect::<Vec<TI>>();
@@ -771,10 +786,10 @@ pub mod test {
         n: usize,
     ) -> proptest::test_runner::TestCaseResult
     where
-        TA: Datum + AsPrimitive<TI>,
-        TB: Datum + AsPrimitive<TI>,
-        TC: Datum,
-        TI: Datum + AsPrimitive<TC>,
+        TA: LADatum + AsPrimitive<TI>,
+        TB: LADatum + AsPrimitive<TI>,
+        TC: LADatum,
+        TI: LADatum + AsPrimitive<TC>,
         usize: AsPrimitive<TI>,
     {
         let bias = (0..n).map(|i| i.as_()).collect::<Vec<TI>>();
@@ -793,10 +808,10 @@ pub mod test {
         n: usize,
     ) -> proptest::test_runner::TestCaseResult
     where
-        TA: Datum + AsPrimitive<TI>,
-        TB: Datum + AsPrimitive<TI>,
-        TC: Datum,
-        TI: Datum + AsPrimitive<TC>,
+        TA: LADatum + AsPrimitive<TI>,
+        TB: LADatum + AsPrimitive<TI>,
+        TC: LADatum,
+        TI: LADatum + AsPrimitive<TC>,
         usize: AsPrimitive<TI>,
     {
         let five: TI = 5.as_();
@@ -811,10 +826,10 @@ pub mod test {
         n: usize,
     ) -> proptest::test_runner::TestCaseResult
     where
-        TA: Datum + AsPrimitive<TI>,
-        TB: Datum + AsPrimitive<TI>,
-        TC: Datum,
-        TI: Datum + AsPrimitive<TC>,
+        TA: LADatum + AsPrimitive<TI>,
+        TB: LADatum + AsPrimitive<TI>,
+        TC: LADatum,
+        TI: LADatum + AsPrimitive<TC>,
         usize: AsPrimitive<TI>,
     {
         let five: TI = 5.as_();
@@ -824,7 +839,7 @@ pub mod test {
     }
 
     #[derive(Clone, Debug)]
-    pub struct ConvProblem<TA: Datum, TB: Datum> {
+    pub struct ConvProblem<TA: LADatum, TB: LADatum> {
         pub ci: usize,
         pub co: usize,
         pub kt: usize,
@@ -834,7 +849,7 @@ pub mod test {
         pub data: Vec<TB>,
     }
 
-    impl<TA: Datum, TB: Datum> ConvProblem<TA, TB> {
+    impl<TA: LADatum, TB: LADatum> ConvProblem<TA, TB> {
         pub fn kernel_field(&self) -> usize {
             self.dilation * (self.kt - 1) + 1
         }
@@ -869,10 +884,10 @@ pub mod test {
 
         pub fn expected<TC, TI>(&self) -> Vec<TC>
         where
-            TA: Datum + AsPrimitive<TI>,
-            TB: Datum + AsPrimitive<TI>,
-            TC: Datum,
-            TI: Datum + AsPrimitive<TC>,
+            TA: LADatum + AsPrimitive<TI>,
+            TB: LADatum + AsPrimitive<TI>,
+            TC: LADatum,
+            TI: LADatum + AsPrimitive<TC>,
         {
             let mut expect = vec![TI::zero(); self.co * self.output_width()];
             for x in 0..self.output_width() {
@@ -893,29 +908,32 @@ pub mod test {
 
         pub fn run<K: MatMatMulKer<TA, TB, TC, TI>, TC, TI>(&self) -> Vec<TC>
         where
-            TI: Datum,
-            TC: Datum,
+            TI: LADatum,
+            TC: LADatum,
         {
             unsafe {
                 let mut op = MatMatMulImpl::<K, TA, TB, TC, TI>::new(self.m(), self.k(), self.n());
                 op.b_from_data_and_offsets(&self.data_rows_offsets(), &self.data_cols_offsets());
-                let mut packed_a =
-                    Buffer::uninitialized(op.a_pack().len(), op.a_pack().alignment());
+                let mut packed_a = Tensor::uninitialized_aligned::<TA>(
+                    &[op.a_pack().len()],
+                    op.a_pack().alignment(),
+                )
+                .unwrap();
                 op.a_pack().pack(
-                    packed_a.as_mut_ptr(),
+                    packed_a.as_ptr_mut_unchecked(),
                     self.filters.as_ptr(),
                     self.k() as isize,
                     1,
                 );
 
                 let mut found: Vec<TC> = vec![TC::max_value(); self.co * self.output_width()];
-                op.run(packed_a.as_ptr(), self.data.as_ptr(), found.as_mut_ptr(), &[]);
+                op.run(packed_a.as_ptr_unchecked(), self.data.as_ptr(), found.as_mut_ptr(), &[]);
                 found
             }
         }
     }
 
-    pub fn strat_conv_1d<TA: Datum, TB: Datum>() -> BoxedStrategy<ConvProblem<TA, TB>>
+    pub fn strat_conv_1d<TA: LADatum, TB: LADatum>() -> BoxedStrategy<ConvProblem<TA, TB>>
     where
         isize: AsPrimitive<TA> + AsPrimitive<TB>,
     {
