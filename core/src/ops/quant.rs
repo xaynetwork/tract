@@ -13,6 +13,7 @@ pub struct QParams {
     pub zero_point_c: Option<Arc<Tensor>>,
     #[educe(Hash(method = "hash_scale"))]
     pub scale_factor: Option<f32>,
+    pub inputs_kind: Option<TVec<QParamsInputKind>>,
 }
 
 fn hash_scale<H: std::hash::Hasher>(it: &Option<f32>, state: &mut H) {
@@ -42,6 +43,14 @@ fn cleanup_zeropoint_t<T: Datum + Zero + Copy>(zp: &Arc<Tensor>) -> Option<Arc<T
     }
 }
 
+#[derive(Clone, Debug, Hash)]
+pub enum QParamsInputKind {
+    ZeroPointA(usize),
+    ZeroPointB(usize),
+    ZeroPointC(usize),
+    ScaleABC(usize, usize, usize),
+}
+
 impl QParams {
     pub fn new(dt: DatumType) -> QParams {
         QParams {
@@ -50,6 +59,7 @@ impl QParams {
             zero_point_b: None,
             zero_point_c: None,
             scale_factor: None,
+            inputs_kind: None,
         }
     }
 
@@ -69,6 +79,10 @@ impl QParams {
         QParams { scale_factor: Some(scale_factor), ..self }
     }
 
+    pub fn with_inputs_kind(self, inputs_kind: TVec<QParamsInputKind>) -> QParams {
+        QParams { inputs_kind: Some(inputs_kind), ..self }
+    }
+
     pub fn set_zero_point_a(&mut self, zero_point: &Arc<Tensor>) {
         self.zero_point_a = cleanup_zeropoint(zero_point);
     }
@@ -83,6 +97,10 @@ impl QParams {
 
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = Some(scale_factor)
+    }
+
+    pub fn set_inputs_kind(&mut self, inputs_kind: TVec<QParamsInputKind>) {
+        self.inputs_kind = Some(inputs_kind);
     }
 }
 
