@@ -19,6 +19,7 @@ members = [
     "examples/nnef-mobilenet-v2",
     "examples/onnx-mobilenet-v2",
     "examples/pytorch-resnet",
+    "examples/bug",
     "harness/core-proptest-pulse",
     "harness/lstm-proptest-onnx-vs-tf",
     "harness/nnef-inceptionv3",

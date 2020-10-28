@@ -1,0 +1,10 @@
+[package]
+name = "bug"
+version = "0.1.0"
+authors = ["Andrea Corradi <andrea.corradi@xain.io>"]
+edition = "2018"
+
+[dependencies]
+tract-onnx = { path = "../../onnx" }
+env_logger = "0.8.1"
+log = "0.4"

@@ -208,6 +208,14 @@ impl Expansion for DynamicQuantizeLinear {
     ) -> TractResult<TVec<OutletId>> {
         let op: Box<dyn TypedOp> = Box::new(DynamicQuantizeLinearU8::new());
         target.wire_node(format!("{}.dynamic_quantize", prefix), op, &[inputs[0]])
+
+        // with this code instead the model is optimized without errors
+        // let op: Box<dyn TypedOp> = Box::new(DynamicQuantizeLinearU8::new());
+        // let outputs = target.wire_node(format!("{}.dynamic_quantize", prefix), op, &[inputs[0]])?;
+        // let scale = target.add_const(format!("{}.dynamic_quantize_scale", prefix), rctensor0(0f32))?;
+        // let zero_point = target.add_const(format!("{}.dynamic_quantize_zero_point", prefix), rctensor0(0u8))?;
+
+        // Ok(tvec!(outputs[0], scale, zero_point))
     }
 }
 
