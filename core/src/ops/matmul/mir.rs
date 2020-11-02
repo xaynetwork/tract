@@ -298,11 +298,12 @@ impl TypedOp for MatMul {
         let t_konst = [self.a_trans, self.b_trans][konst_ix] ^ flip;
         let t_var = [self.b_trans, self.a_trans][konst_ix] ^ flip;
         let konst = model.outlet_fact(node.inputs[konst_ix])?.konst.clone().unwrap();
+        let q_params = self.q_params.clone().map(|qp| qp.with_inputs_kind_offset(-1));
         let patch = TypedModelPatch::replace_single_op(
             model,
             node,
             &node.inputs[var_ix..][..1],
-            MatMulUnary::new(konst, t_konst, t_var, self.c_trans ^ flip, self.q_params.clone()),
+            MatMulUnary::new(konst, t_konst, t_var, self.c_trans ^ flip, q_params),
         )?
         .with_context("to unary");
         return Ok(Some(patch));

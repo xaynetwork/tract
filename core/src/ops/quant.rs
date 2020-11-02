@@ -51,6 +51,20 @@ pub enum QParamsInputKind {
     ScaleABC(usize, usize, usize),
 }
 
+impl QParamsInputKind {
+    fn offset(&self, count: isize) -> Self {
+        let offset = |ix: &usize| ((*ix as isize) + count) as usize;
+        match self {
+            QParamsInputKind::ZeroPointA(ix) => QParamsInputKind::ZeroPointA(offset(ix)),
+            QParamsInputKind::ZeroPointB(ix) => QParamsInputKind::ZeroPointB(offset(ix)),
+            QParamsInputKind::ZeroPointC(ix) => QParamsInputKind::ZeroPointC(offset(ix)),
+            QParamsInputKind::ScaleABC(a_ix, b_ix, c_ix) => {
+                QParamsInputKind::ScaleABC(offset(a_ix), offset(b_ix), offset(c_ix))
+            }
+        }
+    }
+}
+
 impl QParams {
     pub fn new(dt: DatumType) -> QParams {
         QParams {
@@ -101,6 +115,14 @@ impl QParams {
 
     pub fn set_inputs_kind(&mut self, inputs_kind: TVec<QParamsInputKind>) {
         self.inputs_kind = Some(inputs_kind);
+    }
+
+    pub fn with_inputs_kind_offset(self, count: isize) -> QParams {
+        let inputs_kind = self.inputs_kind.map(|inputs_kind| {
+            inputs_kind.iter().map(|input_kind| input_kind.offset(count)).collect()
+        });
+
+        QParams { inputs_kind, ..self }
     }
 }
 
