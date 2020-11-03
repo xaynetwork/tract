@@ -27,7 +27,7 @@ pub struct IntoAst<'a> {
     pub parameters: Vec<String>,
     pub results: Vec<String>,
     pub mapping: HashMap<OutletId, Arc<RValue>>,
-    pub tensors: HashMap<String, Arc<Tensor>>,
+    pub tensors: Vec<(String, Arc<Tensor>)>,
     pub fragments: HashMap<String, FragmentDef>,
     pub body: Vec<Assignment>,
 }
@@ -206,12 +206,16 @@ impl<'a> IntoAst<'a> {
                 let names: Vec<String> = (0..node.outputs.len())
                     .map(|ix| if ix > 0 { format!("{}_{}", scoped, ix) } else { scoped.clone() })
                     .collect();
-                let lvalue = if node.outputs.len() > 1 {
-                    LValue::Tuple(names.iter().map(|n| LValue::Identifier(n.clone())).collect())
+                if node.outputs.len() > 1 {
+                    self.body.push(Assignment {
+                        left: LValue::Tuple(
+                            names.iter().map(|n| LValue::Identifier(n.clone())).collect(),
+                        ),
+                        right: outputs.as_ref().clone(),
+                    });
                 } else {
-                    LValue::Identifier(names[0].clone())
+                    self.assignment(&names[0], outputs);
                 };
-                self.body.push(Assignment { left: lvalue, right: outputs.as_ref().clone() });
                 let mut outputs = tvec!();
                 for (ix, o) in names.into_iter().enumerate() {
                     let rv = Arc::new(ident(o));
@@ -274,7 +278,7 @@ impl<'a> IntoAst<'a> {
             }
         } else {
             let name = name.into();
-            self.tensors.insert(name.clone(), tensor.clone());
+            self.tensors.push((name.clone(), tensor.clone()));
             let id = self.scoped_id(&name);
             self.assignment(
                 &id,
@@ -293,7 +297,11 @@ impl<'a> IntoAst<'a> {
     }
 
     fn assignment(&mut self, name: impl Into<String>, right: Arc<RValue>) {
-        self.body.push(assignment(name, right))
+        let name = name.into();
+        if &*right == &ident(&name) {
+            return;
+        }
+        self.body.push(assignment(&name, right))
     }
 }
 

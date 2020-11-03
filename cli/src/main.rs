@@ -138,6 +138,8 @@ fn main() -> tract_core::anyhow::Result<()> {
     (@arg partial: --partial "Before analyse, eliminate dead branches")
 
     (@arg pass: --pass +takes_value possible_values(STAGES) "Pass to stop preprocessing after.")
+    (@arg declutter_step: --("declutter-step") +takes_value "Stop decluttering process after application of patch number N")
+
     (@arg nnef_cycle: --("nnef-cycle") "Perform NNEF dump and reload before optimizing")
     (@arg nnef_tract_core: --("nnef-tract-core") "Allow usage of tract-core extension in NNEF dump and load")
     (@arg nnef_tract_onnx: --("nnef-tract-onnx") "Allow usage of tract-onnx extension in NNEF dump and load")
@@ -239,6 +241,12 @@ fn main() -> tract_core::anyhow::Result<()> {
             .takes_value(true)
             .long("nnef")
             .help("Dump the network in NNEF format (as a tar.gz file)"),
+            )
+        .arg(
+            Arg::with_name("nnef-graph")
+            .takes_value(true)
+            .long("nnef-graph")
+            .help("Dump the network definition (without the weights) as a graph.nnef-like file"),
             )
         .arg(
             Arg::with_name("assert-output")

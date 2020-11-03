@@ -177,7 +177,7 @@ impl AxisOp {
                 }
             }
             (Rm(op), Reshape(at, from, to)) => {
-                if op <= at {
+                if op < at {
                     Some((Some(Rm(*op)), Some(Reshape(at - 1, from.clone(), to.clone()))))
                 } else if *op > at + from.len() {
                     Some((
@@ -396,8 +396,8 @@ impl Op for AxisOp {
             Reshape(at, from, to) => Ok(vec![format!(
                 "Axes starting at {}: {:?} to {:?}",
                 at,
-                from.iter().join("x"),
-                to.iter().join("x")
+                from.iter().join(","),
+                to.iter().join(",")
             )]),
         }
     }

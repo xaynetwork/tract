@@ -115,68 +115,9 @@ impl TypedModel {
         Ok(())
     }
 
-    fn optimize_passes(
-        &self,
-        passes: &mut [Box<dyn crate::optim::TypedPass>],
-    ) -> TractResult<TypedModel> {
-        #[cfg(all(debug_assertions, feature = "paranoid_assertions"))]
-        {
-            self.check_consistent_facts()?;
-        }
-        let mut model = self.clone();
-        let mut seen = std::collections::HashSet::new();
-        for i in 0.. {
-            model = model.compact()?;
-            let mut done_something_this_time = false;
-            'pass: for p in passes.iter_mut() {
-                loop {
-                    let mut done_something_this_pass = false;
-                    p.reset()?;
-                    while let Some(mut patch) = p.next(&model)? {
-                        patch.push_context(format!("{:?}/{}", p, i));
-                        #[cfg(all(debug_assertions, feature = "paranoid_assertions"))]
-                        {
-                            patch.model.check_consistent_facts()?;
-                            model.check_consistent_facts()?;
-                            patch.model.invariants()?;
-                            model.invariants()?;
-                        }
-                        debug!("applying: {}", patch.context.iter().rev().join(" >> "),);
-                        patch.apply(&mut model)?;
-                        done_something_this_pass = true;
-                        done_something_this_time = true;
-                    }
-                    #[cfg(all(debug_assertions, feature = "paranoid_assertions"))]
-                    {
-                        model.check_edges()?;
-                        model
-                            .check_consistent_facts()
-                            .with_context(|| format!("after declutter pass {:?}", p))?
-                    }
-                    if !done_something_this_pass {
-                        continue 'pass;
-                    }
-                }
-            }
-            if !done_something_this_time {
-                return Ok(model);
-            }
-            if i < 10 {
-                continue;
-            }
-            let sig = model.signature();
-            if seen.contains(&sig) {
-                return Ok(model);
-            }
-            seen.insert(sig);
-            model = model.compact()?;
-        }
-        unreachable!()
-    }
-
     /// Perform declutter passes on the network.
     pub fn declutter(&self) -> TractResult<TypedModel> {
-        self.optimize_passes(&mut crate::optim::declutter())
+        crate::optim::Optimizer::declutter().optimize(&self)
     }
 
     pub fn concretize_dims(&self, values: &SymbolValues) -> TractResult<TypedModel> {
@@ -197,7 +138,7 @@ impl TypedModel {
 
     /// Translate the graph to locally optimized operators (LIR or MIR ops).
     pub fn optimize(self) -> TractResult<TypedModel> {
-        self.optimize_passes(&mut crate::optim::codegen())
+        crate::optim::Optimizer::codegen().optimize(&self)
     }
 
     pub fn invariants(&self) -> TractResult<invariants::Invariants> {
