@@ -567,7 +567,7 @@ impl TypedOp for MatMulUnary {
         model: &TypedModel,
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
-        let b = args_1!(model.node_input_facts(node.id)?);
+        let b = model.node_input_facts(node.id)?[0];
         if let Some(b_shape) = b.shape.as_finite() {
             let patch =
                 if (self.a.datum_type(), b.datum_type) == (f32::datum_type(), f32::datum_type()) {
