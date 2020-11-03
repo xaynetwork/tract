@@ -302,7 +302,7 @@ impl TypedOp for MatMul {
         let patch = TypedModelPatch::replace_single_op(
             model,
             node,
-            &node.inputs[var_ix..][..1],
+            &node.inputs[var_ix..],
             MatMulUnary::new(konst, t_konst, t_var, self.c_trans ^ flip, q_params),
         )?
         .with_context("to unary");
