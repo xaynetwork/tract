@@ -39,7 +39,7 @@ tract_data::impl_dyn_hash!(ConvUnary);
 impl ConvUnary {
     fn input_channels(&self) -> usize {
         match self.kernel_fmt {
-            KernelFormat::OIHW => self.kernel.shape()[1],
+            KernelFormat::OIHW => self.kernel.shape()[1] * self.group,
             KernelFormat::HWIO => self.kernel.shape()[self.kernel.shape().len() - 2],
         }
     }
@@ -64,7 +64,7 @@ impl ConvUnary {
             KernelFormat::HWIO => {
                 let mut shape = self.kernel.shape().to_vec();
                 shape.insert(hw_rank + 1, self.group); // HWIGO
-                shape[hw_rank] /= self.group;
+                shape[self.pool_spec.rank()] = self.input_channels() / self.group;
                 let mut kernel = self.kernel.as_ref().clone();
                 kernel.set_shape(&shape)?;
                 let mut permutation: Vec<usize> = vec![hw_rank + 1, hw_rank + 2, hw_rank];
@@ -79,13 +79,14 @@ impl ConvUnary {
         }
     }
 
+    // returns an Array of Tensors. shape of the array is [group]
     fn kernel_as_packed_as<T: Datum + Copy + Zero>(
         &self,
         packer: &PackA,
     ) -> TractResult<ArrayD<Arc<Tensor>>> {
-        let kernel = self.kernel_as_group_o_ihw()?;
-        let kernel = kernel.to_array_view::<T>()?;
-        let packed_as = Array1::from(
+        let kernel_g_o_ihw = self.kernel_as_group_o_ihw()?;
+        let kernel = kernel_g_o_ihw.to_array_view::<T>()?;
+        let mut packed_as = Array1::from(
             kernel
                 .outer_iter()
                 .map(|subkernel| {
@@ -103,7 +104,10 @@ impl ConvUnary {
                 .collect::<TractResult<Vec<_>>>()?,
         )
         .into_dyn();
-        Ok(packed_as.insert_axis(Axis(0)))
+        if self.pool_spec.data_format.has_n() {
+            packed_as.insert_axis_inplace(Axis(0));
+        }
+        Ok(packed_as)
     }
 
     fn bias_as_non_linear<T>(&self) -> TractResult<Option<ArrayD<Vec<FusedSpec<T>>>>>
@@ -114,17 +118,18 @@ impl ConvUnary {
         if let Some(bias) = &self.bias {
             let bias = bias.cast_to::<T>()?;
             let bias = bias.as_slice::<T>()?;
-            Ok(Some(
-                Array2::from_shape_vec(
-                    (1, self.group),
-                    bias.iter()
-                        .chunks(self.output_channels() / self.group)
-                        .into_iter()
-                        .map(|c| vec![FusedSpec::PerRowAdd(c.into_iter().cloned().collect())])
-                        .collect(),
-                )?
-                .into_dyn(),
-            ))
+            let mut bias = Array1::from(
+                bias.iter()
+                    .chunks(self.output_channels() / self.group)
+                    .into_iter()
+                    .map(|c| vec![FusedSpec::PerRowAdd(c.into_iter().cloned().collect())])
+                    .collect::<Vec<_>>(),
+            )
+            .into_dyn();
+            if self.pool_spec.data_format.has_n() {
+                bias.insert_axis_inplace(Axis(0));
+            }
+            Ok(Some(bias))
         } else {
             Ok(None)
         }
@@ -225,7 +230,7 @@ impl ConvUnary {
                 format!("{}.im2col", name),
                 Im2Col::new(
                     geo.clone(),
-                    input_shape,
+                    self.pool_spec.data_format.clone(),
                     m,
                     k,
                     n,
@@ -245,27 +250,22 @@ impl ConvUnary {
             )?[0];
         }
 
-        let c_prefix_dim_and_stride = if *output_shape.n().unwrap_or(&1) != 1 || self.group != 1 {
-            let mut dims = tvec!(self.group as usize);
-            let mut strides =
-                tvec!((output_shape.c() / self.group * output_shape.c_stride()) as isize);
-            if output_shape.n().is_some() {
-                dims.insert(0, *output_shape.n().unwrap());
-                strides.insert(0, *output_shape.n_stride().unwrap() as isize);
-            }
-            Some((dims, strides))
-        } else {
-            None
-        };
+        let mut dims = tvec!(self.group as usize);
+        let mut strides = tvec!((output_shape.c() / self.group * output_shape.c_stride()) as isize);
+        if output_shape.n().is_some() {
+            dims.insert(0, *output_shape.n().unwrap());
+            strides.insert(0, *output_shape.n_stride().unwrap() as isize);
+        }
 
+        let kernels = self.kernel_as_packed_as::<TA>(&mmm.as_mmm().a_pack())?;
         wire = model.wire_node(
             format!("{}.matmatmul", name),
             matmul::lir::MatMatMulUnaryFinite {
                 c_trans: true,
                 bc_c_shape: output_shape.shape.clone(),
                 c_fact: TypedFact::dt_shape(TC::datum_type(), &*output_shape.shape)?,
-                c_prefix_dim_and_stride,
-                packed_as: self.kernel_as_packed_as::<TA>(&mmm.as_mmm().a_pack())?,
+                c_prefix_dim_and_stride: Some((dims, strides)),
+                packed_as: kernels,
                 fused_ops: self.bias_as_non_linear()?,
                 mmm,
             },
@@ -284,7 +284,7 @@ impl ConvUnary {
             patch,
             input_shape,
             output_shape,
-            self.kernel_as_group_o_ihw()?,
+            self.kernel_as_group_o_ihw().context("in kernel_as_group_o_ihw")?,
             self.bias.clone(),
         );
         Ok(Box::new(op))
@@ -459,7 +459,26 @@ impl EvalOp for ConvUnary {
 
 impl TypedOp for ConvUnary {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        if self.pool_spec.data_format.shape(&*inputs[0].shape)?.c()
+            != &self.input_channels().to_dim()
+        {
+            bail!(
+                "Inconsistent convolution: input is {:?}, kernel expects {} input channels, {:?}",
+                inputs[0],
+                self.input_channels(),
+                self
+            );
+        }
+        if self.pool_spec.output_channel_override != Some(self.output_channels()) {
+            bail!(
+                "Inconsistent convolution: output channels from pool spec is {:?}, kernel expects {} output channels, {:?}",
+                self.pool_spec.output_channel_override,
+                self.output_channels(),
+                self
+                );
+        }
         let mut fact = self.pool_spec.output_facts(inputs)?.remove(0);
+
         if let Some(bias) = &self.bias {
             if bias.len() != self.output_channels() {
                 bail!("Bias should have one value per output channel, got:{:?}", bias);
@@ -718,19 +737,24 @@ impl TypedOp for ConvUnary {
                 ) {
                     let mut patch = TypedModelPatch::default();
                     let wire = patch.tap_model(model, node.inputs[0])?;
-                    let wire = self.wire_as_im2col_pair(&mut patch, &*node.name, wire, true)?;
+                    let wire = self
+                        .wire_as_im2col_pair(&mut patch, &*node.name, wire, true)
+                        .context("in wire_as_im2col_pair, direct")?;
                     patch.shunt_outside(model, OutletId::new(node.id, 0), wire)?;
                     return Ok(Some(patch));
-                } else if self.group != 1 && self.group == self.output_channels() {
-                    return Ok(Some(TypedModelPatch::single_unary_op(
-                        model,
-                        node,
-                        dispatch_floatlike!(Self::to_depth_wise(dt)(self, &shape))?,
-                    )?));
+                } else if self.group != 1
+                    && self.group == self.output_channels()
+                    && self.group == self.input_channels()
+                {
+                    let op = dispatch_floatlike!(Self::to_depth_wise(dt)(self, &shape))
+                        .context("in to_depth_wise")?;
+                    return Ok(Some(TypedModelPatch::single_unary_op(model, node, op)?));
                 } else {
                     let mut patch = TypedModelPatch::default();
                     let wire = patch.tap_model(model, node.inputs[0])?;
-                    let wire = self.wire_as_im2col_pair(&mut patch, &*node.name, wire, false)?;
+                    let wire = self
+                        .wire_as_im2col_pair(&mut patch, &*node.name, wire, false)
+                        .context("in wire_as_im2col_pair, indirect")?;
                     patch.shunt_outside(model, OutletId::new(node.id, 0), wire)?;
                     return Ok(Some(patch));
                 }
