@@ -53,6 +53,7 @@ fn compute_shape(input: &[TDim], shape_spec: &[TDim]) -> TractResult<TVec<TDim>>
     let mut shape: TVec<TDim> = shape_spec.into();
 
     // deal with zeros, stop if we see a -1
+    #[inline(never)]
     fn deal_with_zero<'a>(
         mut input_dims: std::iter::Peekable<impl Iterator<Item = &'a TDim>>,
         shape: &mut [TDim],
